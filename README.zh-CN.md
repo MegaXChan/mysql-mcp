@@ -3,6 +3,7 @@
 [English](README.md) | 简体中文
 
 [![CI](https://github.com/MegaXChan/mysql-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/MegaXChan/mysql-mcp/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/MegaXChan/mysql-mcp?display_name=tag&sort=semver)](https://github.com/MegaXChan/mysql-mcp/releases/latest)
 
 `mysql-mcp` 是一个使用 Go 编写的 MySQL Model Context Protocol（MCP）服务端。它支持 MySQL 5.7、MySQL 8.x、多数据源、stdio 与 Streamable HTTP，并将查询、元数据、监控、存储函数和少量管理操作拆分为边界明确的工具。
 
@@ -74,12 +75,29 @@ make docker-build \
 
 最终镜像使用 `scratch`，仅包含静态 `mysql-mcp` 二进制文件和 CA 证书包，并以非 root UID/GID `65532:65532` 运行。镜像不会内置配置文件、数据库密码、HTTP Token 或任何其他 secret。
 
-可从 Docker Hub 拉取持续更新的开发镜像，或固定到明确版本：
+Docker Hub 提供三类面向用户的标签：
+
+| 标签 | 含义 |
+|---|---|
+| `megaxcn/mysql-mcp:latest` | 最新的稳定 SemVer 版本 |
+| `megaxcn/mysql-mcp:edge` | 从 `master` 或 `main` 持续更新的开发镜像 |
+| `megaxcn/mysql-mcp:vX.Y.Z` | 不可变的精确版本；可复现部署推荐使用 |
+
+通常直接使用 `latest` 获取最新稳定版；只有明确需要持续更新的开发构建时才使用 `edge`：
 
 ```bash
+docker pull megaxcn/mysql-mcp:latest
 docker pull megaxcn/mysql-mcp:edge
-docker pull megaxcn/mysql-mcp:v1.0.0
 ```
+
+如需快速检查版本，`--pull=always` 会让 Docker 在启动容器前刷新这个浮动标签：
+
+```bash
+docker run --pull=always --rm megaxcn/mysql-mcp:latest --version
+docker run --pull=always --rm megaxcn/mysql-mcp:edge --version
+```
+
+如需可复现部署或回滚，请把 `latest` 替换为 GitHub Releases 页面显示的精确标签，例如 `vX.Y.Z`。
 
 每个已发布标签都是多架构 manifest，支持 `linux/386`、`linux/amd64`、`linux/arm/v6`、`linux/arm/v7` 和 `linux/arm64`。Docker 会自动选择与宿主机平台匹配的镜像。
 
@@ -96,14 +114,17 @@ server:
 
 ```bash
 docker run --rm \
+  --pull=always \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   -p 127.0.0.1:8080:8080 \
   --env-file ./mysql-mcp.env \
   --mount type=bind,src="$(pwd)/config.yaml",dst=/etc/mysql-mcp/config.yaml,readonly \
-  megaxcn/mysql-mcp:v1.0.0
+  megaxcn/mysql-mcp:latest
 ```
+
+上面的命令会跟随最新稳定版；如果部署不能自动升级，请把 `latest` 替换为明确的 `vX.Y.Z` 标签。
 
 应将 `mysql-mcp.env` 作为 secret 保护且不得提交。优先使用环境变量或编排器托管的 secrets。若使用 `password_file`、`token_file`、TLS 私钥或其他文件型 secret，应将每个文件分别只读挂载，并确保容器 UID `65532` 对其具有读取权限。由于运行时为 `scratch` 且根文件系统只读，容器内没有 shell、包管理器或可写配置目录。
 
@@ -123,10 +144,12 @@ curl --fail http://127.0.0.1:8080/readyz
 版本标签必须使用带 `v` 前缀的 SemVer。支持预发布标识，但拒绝 `+build` 元数据，因为不同 SemVer 值转换为 Docker 标签时可能发生碰撞。
 
 - 推送到 `master` 或 `main` 会发布滚动更新的 Docker 标签 `megaxcn/mysql-mcp:edge`，但不会创建 GitHub Release。
-- 推送 `v1.0.0` 这样的稳定标签只会发布 `v1.0.0` 和 `1.0.0` 两个精确 Docker 标签，然后创建包含已打包二进制文件及 `SHA256SUMS` 的 GitHub Release。
-- 推送 `v1.1.0-rc.1` 这样的预发布标签同样只会发布 `v1.1.0-rc.1` 和 `1.1.0-rc.1`，然后创建预发布 GitHub Release。
+- 推送 `v1.0.0` 这样的稳定标签会发布 `v1.0.0` 和 `1.0.0` 两个精确 Docker 标签，创建包含已打包二进制文件及 `SHA256SUMS` 的 GitHub Release，然后根据全部已发布 GitHub Releases 中的最高稳定 SemVer 校准 `latest`。
+- 推送 `v1.1.0-rc.1` 这样的预发布标签只发布 `v1.1.0-rc.1` 和 `1.1.0-rc.1` 两个精确标签，然后创建预发布 GitHub Release；预发布绝不更新 `latest`。
 
-项目有意不发布 `latest`、主版本或主/次版本浮动标签，以免补发旧版本或并发发布时将共享标签回退到旧内容。已发布的 Docker 版本标签和 GitHub Release 都不可变：工作流会拒绝覆盖已有对象，因此修正或重发必须使用新的版本号。
+`latest` 始终表示发布流程已知的最高稳定 SemVer 版本。补发或重跑较旧的稳定版本不会使其回退；即使 `latest` 被删除，任意稳定版发布任务也会根据全局最高且已验证的 Release 重建它。项目不发布主版本或主/次版本浮动标签。精确 Docker 版本标签和 GitHub Release 资产均不可变：完全相同的重跑会在验证后通过，而替换或修正已有制品必须使用新版本号；`edge` 与 `latest` 是有意设计为可移动的别名。
+
+如果 Runner 在 GitHub 仍保留不完整 Draft Release 时中断，请先检查并删除该草稿，再重跑同一标签。工作流会有意拒绝覆盖远端的部分资产，也不会猜测如何修复它们。
 
 发布下载使用 `CGO_ENABLED=0` 构建，覆盖以下目标：
 
@@ -170,7 +193,7 @@ git tag -a v1.0.0 -m 'v1.0.0'
 git push origin v1.0.0 # 发布稳定镜像与 GitHub Release
 ```
 
-请使用仓库 ruleset 保护 `master`/`main` 及 `v*` 标签命名空间，并仅允许可信维护者修改发布流水线、创建发布标签及访问 Docker Hub 凭据。如果 Docker Hub 为该仓库提供 tag immutability 功能，也应将其启用。
+请使用仓库 ruleset 保护 `master`/`main` 及 `v*` 标签命名空间，并仅允许可信维护者修改发布流水线、创建发布标签及访问 Docker Hub 凭据。若 Docker Hub 支持 tag immutability 规则，只应对精确 SemVer 标签启用；`latest` 与 `edge` 必须保持可变。
 
 ## 快速开始
 

@@ -209,7 +209,38 @@ jobs:
             error_file="${inspect_dir}/error-${inspect_index}.txt"
             inspect_index=$((inspect_index + 1))
 
-            if docker buildx imagetools inspect --format '{{json .Manifest}}' "${image_ref}" >"${manifest_file}" 2>"${error_file}"; then
+            tag_exists=false
+            not_found_count=0
+            for inspect_attempt in 1 2 3; do
+              if docker buildx imagetools inspect --format '{{json .Manifest}}' "${image_ref}" >"${manifest_file}" 2>"${error_file}"; then
+                tag_exists=true
+                break
+              fi
+
+              inspect_error="$(<"${error_file}")"
+              lower_error="$(printf '%s' "${inspect_error}" | tr '[:upper:]' '[:lower:]')"
+              lower_ref="$(printf '%s' "${image_ref}" | tr '[:upper:]' '[:lower:]')"
+              # Only three explicit not-found responses naming this exact
+              # reference authorize creation. Registry, proxy, auth, mixed,
+              # and ambiguous errors fail closed so an immutable release tag
+              # cannot be overwritten after a transient failure.
+              if [[ "${lower_error}" == *"${lower_ref}: not found"* ||
+                    "${lower_error}" == *"${lower_ref}: manifest unknown"* ||
+                    "${lower_error}" == *"${lower_ref}: no such manifest"* ||
+                    "${lower_error}" == *"${lower_ref}: manifest not found"* ||
+                    "${lower_error}" == *"${lower_ref} not found"* ]]; then
+                not_found_count=$((not_found_count + 1))
+              else
+                echo "Could not safely determine whether Docker tag exists: ${image_ref}" >&2
+                printf '%s\n' "${inspect_error}" >&2
+                exit 1
+              fi
+              if (( inspect_attempt < 3 )); then
+                sleep "${inspect_attempt}"
+              fi
+            done
+
+            if [[ "${tag_exists}" == true ]]; then
               published_revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // ""' "${manifest_file}")"
               published_digest="$(jq -r '.digest // ""' "${manifest_file}")"
               if [[ -z "${published_revision}" ]]; then
@@ -233,22 +264,11 @@ jobs:
               continue
             fi
 
-            inspect_error="$(<"${error_file}")"
-            shopt -s nocasematch
-            if [[ "${inspect_error}" == *"${image_ref}: not found"* ||
-                  "${inspect_error}" =~ manifest[[:space:]]+unknown ||
-                  "${inspect_error}" =~ no[[:space:]]+such[[:space:]]+manifest ||
-                  "${inspect_error}" =~ manifest[^[:cntrl:]]*not[[:space:]]+found ||
-                  "${inspect_error}" =~ status[^[:cntrl:]]*404 ||
-                  "${inspect_error}" =~ 404[[:space:]]+not[[:space:]]+found ]]; then
-              missing_tags+=("${image_tag}")
-              shopt -u nocasematch
-            else
-              shopt -u nocasematch
-              echo "Could not safely determine whether Docker tag exists: ${image_ref}" >&2
-              printf '%s\n' "${inspect_error}" >&2
+            if (( not_found_count != 3 )); then
+              echo "Docker tag state changed during inspection: ${image_ref}" >&2
               exit 1
             fi
+            missing_tags+=("${image_tag}")
           done
 
           if (( ${#missing_tags[@]} == 0 )); then
@@ -329,8 +349,16 @@ jobs:
           tags: ${{ github.ref_type == 'tag' && steps.release-tags.outputs.tags || steps.meta.outputs.tags }}
           annotations: |
             index:org.opencontainers.image.revision=${{ github.sha }}
+            index:org.opencontainers.image.version=${{ steps.version.outputs.version }}
           cache-from: type=gha,scope=mysql-mcp-publish
           cache-to: type=gha,mode=max,scope=mysql-mcp-publish
+
+      - name: Verify immutable release image aliases
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: bash ./scripts/verify-docker-release.sh
 
   github-release:
     name: Create GitHub Release
@@ -358,24 +386,167 @@ jobs:
           export LC_ALL=C
           sha256sum mysql-mcp_* > SHA256SUMS
 
-      - name: Create or update GitHub Release
+      - name: Create or verify GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
-          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "GitHub Release already exists and will not be overwritten: ${RELEASE_TAG}"
+          set -euo pipefail
+
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "${verify_dir}"' EXIT
+          metadata_file="${verify_dir}/release.json"
+          api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+          if ! http_status="$(curl --silent --show-error --location \
+            --retry 3 --retry-all-errors --connect-timeout 10 --max-time 60 \
+            --output "${metadata_file}" --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "${api_url}")"; then
+            echo "could not determine whether GitHub Release exists: ${RELEASE_TAG}" >&2
             exit 1
           fi
 
-          release_flags=()
-          if [[ "${RELEASE_TAG}" == *-* ]]; then
-            release_flags+=(--prerelease --latest=false)
+          if [[ "${http_status}" == '200' ]]; then
+            expected_prerelease=false
+            if [[ "${RELEASE_TAG}" == *-* ]]; then
+              expected_prerelease=true
+            fi
+            published_tag="$(jq -r '.tag_name // ""' "${metadata_file}")"
+            published_draft="$(jq -r 'if (.draft | type) == "boolean" then (.draft | tostring) else "invalid" end' "${metadata_file}")"
+            published_prerelease="$(jq -r 'if (.prerelease | type) == "boolean" then (.prerelease | tostring) else "invalid" end' "${metadata_file}")"
+            if [[ "${published_tag}" != "${RELEASE_TAG}" ||
+                  "${published_draft}" != 'false' ||
+                  "${published_prerelease}" != "${expected_prerelease}" ]]; then
+              echo "existing GitHub Release metadata conflicts with ${RELEASE_TAG}" >&2
+              exit 1
+            fi
+
+            expected_names="${verify_dir}/expected-names.txt"
+            api_names="${verify_dir}/api-names.txt"
+            downloaded_names="${verify_dir}/downloaded-names.txt"
+            checksum_names="${verify_dir}/checksum-names.txt"
+            archive_names="${verify_dir}/archive-names.txt"
+            local_sizes="${verify_dir}/local-sizes.txt"
+            api_sizes="${verify_dir}/api-sizes.txt"
+            find dist -maxdepth 1 -type f -exec basename {} \; | sort > "${expected_names}"
+            jq -r '.assets[]?.name' "${metadata_file}" | sort > "${api_names}"
+            if ! diff -u "${expected_names}" "${api_names}"; then
+              echo "existing GitHub Release has an unexpected asset set: ${RELEASE_TAG}" >&2
+              exit 1
+            fi
+            for local_asset in dist/*; do
+              printf '%s\t%s\n' "$(basename "${local_asset}")" "$(stat -c '%s' "${local_asset}")"
+            done | sort > "${local_sizes}"
+            jq -r '.assets[]? | [.name, (.size | tostring)] | @tsv' "${metadata_file}" | sort > "${api_sizes}"
+            if ! diff -u "${local_sizes}" "${api_sizes}"; then
+              echo "existing GitHub Release asset sizes differ from this reproducible build" >&2
+              exit 1
+            fi
+
+            remote_assets="${verify_dir}/assets"
+            mkdir -p "${remote_assets}"
+            gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${remote_assets}"
+            find "${remote_assets}" -maxdepth 1 -type f -exec basename {} \; | sort > "${downloaded_names}"
+            if ! diff -u "${expected_names}" "${downloaded_names}"; then
+              echo "downloaded GitHub Release assets are incomplete: ${RELEASE_TAG}" >&2
+              exit 1
+            fi
+            (
+              cd "${remote_assets}"
+              sha256sum --check SHA256SUMS
+            )
+            awk '{print $2}' "${remote_assets}/SHA256SUMS" | sort > "${checksum_names}"
+            grep -Fvx 'SHA256SUMS' "${expected_names}" > "${archive_names}"
+            if ! diff -u "${archive_names}" "${checksum_names}"; then
+              echo "SHA256SUMS does not cover the exact release archive set" >&2
+              exit 1
+            fi
+
+            local_hashes="${verify_dir}/local-assets.sha256"
+            remote_hashes="${verify_dir}/remote-assets.sha256"
+            (
+              cd dist
+              sha256sum * | sort -k2
+            ) > "${local_hashes}"
+            (
+              cd "${remote_assets}"
+              sha256sum * | sort -k2
+            ) > "${remote_hashes}"
+            if ! diff -u "${local_hashes}" "${remote_hashes}"; then
+              echo "existing GitHub Release assets differ from the reproducible artifacts for this tag and revision" >&2
+              exit 1
+            fi
+            echo "GitHub Release already exists and passed immutable-asset verification: ${RELEASE_TAG}"
+            exit 0
           fi
-          gh release create "${RELEASE_TAG}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --generate-notes \
-            --title "${RELEASE_TAG}" \
-            "${release_flags[@]}"
+          if [[ "${http_status}" != '404' ]]; then
+            echo "GitHub Release API returned unexpected HTTP status ${http_status}: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            gh release create "${RELEASE_TAG}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --generate-notes \
+              --title "${RELEASE_TAG}" \
+              --prerelease \
+              --latest=false
+          else
+            gh release create "${RELEASE_TAG}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --generate-notes \
+              --title "${RELEASE_TAG}"
+          fi
+
+  promote-latest:
+    name: Promote latest stable Docker image
+    if: ${{ github.ref_type == 'tag' && contains(github.ref_name, '-') == false }}
+    needs:
+      - github-release
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      # Every surviving run recomputes the global highest stable Release while
+      # holding this lock, so execution order cannot move latest backward.
+      group: docker-latest-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
+
+    steps:
+      - name: Check out repository and all release tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check Docker Hub credentials
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "configure the DOCKERHUB_USERNAME repository variable and DOCKERHUB_TOKEN repository secret"
+            exit 1
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Reconcile latest to the highest stable Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash ./scripts/promote-docker-latest.sh

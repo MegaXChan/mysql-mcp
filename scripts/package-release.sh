@@ -80,6 +80,7 @@ if [[ "$GOOS" == "windows" ]]; then
 	command -v zip >/dev/null 2>&1 || fail 'zip is required to package Windows releases'
 else
 	command -v tar >/dev/null 2>&1 || fail 'tar is required to package Unix releases'
+	command -v gzip >/dev/null 2>&1 || fail 'gzip is required to package Unix releases'
 fi
 
 for required_path in \
@@ -164,18 +165,39 @@ cp "$REPO_ROOT/README.zh-CN.md" "$STAGING_DIR/README.zh-CN.md"
 cp "$REPO_ROOT/config.example.yaml" "$STAGING_DIR/config.example.yaml"
 cp -R "$REPO_ROOT/docs/." "$STAGING_DIR/docs/"
 
+# Normalize archive entry timestamps. Release retries for the same tag and
+# revision must produce byte-identical assets so an existing immutable GitHub
+# Release can be verified rather than overwritten.
+find "$STAGING_DIR" -exec touch -t 200001010000.00 {} +
+touch -t 200001010000.00 "$STAGING_DIR"
+
 readonly TEMP_ARCHIVE="$temp_root/$ARCHIVE_NAME"
 if [[ "$GOOS" == "windows" ]]; then
 	(
 		cd -- "$temp_root"
-		# Info-ZIP treats -- before the archive name as an error. Both names
-		# have a fixed mysql-mcp prefix and cannot be interpreted as options.
-		zip -q -r "$ARCHIVE_NAME" "$PACKAGE_NAME"
+		# -X strips host-specific extra fields, while the sorted explicit input
+		# list makes entry ordering independent of filesystem traversal order.
+		find "$PACKAGE_NAME" -print | LC_ALL=C sort | zip -X -q "$ARCHIVE_NAME" -@
 	)
 else
-	# COPYFILE_DISABLE prevents macOS tar from adding AppleDouble metadata when
-	# a maintainer builds an archive locally on macOS.
-	COPYFILE_DISABLE=1 tar -C "$temp_root" -czf "$TEMP_ARCHIVE" "$PACKAGE_NAME"
+	if tar --version 2>/dev/null | grep -F 'GNU tar' >/dev/null; then
+		(
+			cd -- "$temp_root"
+			# Normalize ordering, ownership, timestamps, and the gzip header on
+			# the Linux release runner so retries are byte-for-byte reproducible.
+			tar --sort=name \
+				--mtime='UTC 2000-01-01' \
+				--owner=0 \
+				--group=0 \
+				--numeric-owner \
+				-cf - "$PACKAGE_NAME" | gzip -n > "$TEMP_ARCHIVE"
+		)
+	else
+		# BSD tar lacks GNU's ordering and ownership flags. Entry mtimes are
+		# already normalized, and a separate gzip -n invocation removes its
+		# timestamped header so repeated local macOS builds remain byte-stable.
+		COPYFILE_DISABLE=1 tar -C "$temp_root" -cf - "$PACKAGE_NAME" | gzip -n > "$TEMP_ARCHIVE"
+	fi
 fi
 
 [[ -s "$TEMP_ARCHIVE" ]] || fail 'packaging produced an empty archive'

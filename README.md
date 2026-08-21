@@ -3,6 +3,7 @@
 English | [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/MegaXChan/mysql-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/MegaXChan/mysql-mcp/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/MegaXChan/mysql-mcp?display_name=tag&sort=semver)](https://github.com/MegaXChan/mysql-mcp/releases/latest)
 
 `mysql-mcp` is a MySQL Model Context Protocol (MCP) server written in Go. It supports MySQL 5.7, MySQL 8.x, multiple data sources, stdio, and Streamable HTTP, with clearly separated tools for queries, metadata, monitoring, stored functions, and a small set of administrative operations.
 
@@ -74,12 +75,32 @@ make docker-build \
 
 The final image uses `scratch`, contains only the static `mysql-mcp` binary and the CA certificate bundle, and runs as the non-root UID/GID `65532:65532`. It does not embed a configuration file, database password, HTTP Token, or any other secret.
 
-Pull the continuously updated development image or pin an exact release from Docker Hub:
+Docker Hub provides three user-facing tag styles:
+
+| Tag | Meaning |
+|---|---|
+| `megaxcn/mysql-mcp:latest` | Newest stable SemVer release |
+| `megaxcn/mysql-mcp:edge` | Continuously updated development image from `master` or `main` |
+| `megaxcn/mysql-mcp:vX.Y.Z` | Immutable exact release; recommended for reproducible deployments |
+
+Normally, use `latest` to fetch the newest stable release. Use `edge` only when
+you explicitly want the continuously updated development build:
 
 ```bash
+docker pull megaxcn/mysql-mcp:latest
 docker pull megaxcn/mysql-mcp:edge
-docker pull megaxcn/mysql-mcp:v1.0.0
 ```
+
+For a quick version check, `--pull=always` makes Docker refresh the moving tag
+before starting the container:
+
+```bash
+docker run --pull=always --rm megaxcn/mysql-mcp:latest --version
+docker run --pull=always --rm megaxcn/mysql-mcp:edge --version
+```
+
+For reproducible deployment or rollback, replace `latest` with an exact tag
+shown on the GitHub Releases page, such as `vX.Y.Z`.
 
 Each published tag is a multi-architecture manifest supporting `linux/386`, `linux/amd64`, `linux/arm/v6`, `linux/arm/v7`, and `linux/arm64`. Docker automatically selects the matching image for the host platform.
 
@@ -96,14 +117,18 @@ Mount the configuration read-only at `/etc/mysql-mcp/config.yaml` and inject ref
 
 ```bash
 docker run --rm \
+  --pull=always \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   -p 127.0.0.1:8080:8080 \
   --env-file ./mysql-mcp.env \
   --mount type=bind,src="$(pwd)/config.yaml",dst=/etc/mysql-mcp/config.yaml,readonly \
-  megaxcn/mysql-mcp:v1.0.0
+  megaxcn/mysql-mcp:latest
 ```
+
+The command above tracks the newest stable release. For a deployment that must
+not upgrade automatically, replace `latest` with a specific `vX.Y.Z` tag.
 
 Protect `mysql-mcp.env` as a secret and do not commit it. Environment variables or orchestrator-managed secrets are preferred. If `password_file`, `token_file`, a TLS private key, or another file-based secret is used, mount each file separately as read-only and ensure container UID `65532` can read it. Because the runtime is `scratch` and the root filesystem is read-only, it has no shell, package manager, or writable configuration location.
 
@@ -123,10 +148,12 @@ Publishing is driven by [the Publish workflow](.github/workflows/release.yml). E
 Release tags must be `v`-prefixed SemVer. Prerelease identifiers are supported, but `+build` metadata is rejected because different SemVer values could otherwise collide when converted to Docker tags.
 
 - A push to `master` or `main` publishes the moving Docker tag `megaxcn/mysql-mcp:edge`; it does not create a GitHub Release.
-- A stable tag such as `v1.0.0` publishes only the exact Docker tags `v1.0.0` and `1.0.0`, then creates a GitHub Release with the packaged binaries and `SHA256SUMS`.
-- A prerelease tag such as `v1.1.0-rc.1` likewise publishes only `v1.1.0-rc.1` and `1.1.0-rc.1`, then creates a prerelease GitHub Release.
+- A stable tag such as `v1.0.0` publishes the exact Docker tags `v1.0.0` and `1.0.0`, creates a GitHub Release with the packaged binaries and `SHA256SUMS`, then reconciles `latest` to the highest stable SemVer across all published GitHub Releases.
+- A prerelease tag such as `v1.1.0-rc.1` publishes only the exact tags `v1.1.0-rc.1` and `1.1.0-rc.1`, then creates a prerelease GitHub Release. Prereleases never update `latest`.
 
-There are deliberately no `latest`, major, or major/minor floating tags. This prevents a republished older release or concurrent publication from moving a shared tag backward. Published Docker version tags and GitHub Releases are immutable: the workflow refuses to overwrite an existing one, so a corrected or repeated release requires a new version number.
+`latest` always represents the highest stable SemVer release known to the publishing workflow. Backfilling or rerunning an older stable version cannot move it backward; if `latest` is missing, any stable release run reconstructs it from the globally highest verified release. Major and major/minor floating tags are not published. Exact Docker version tags and GitHub Release assets are immutable: an identical rerun is verified and accepted, while replacing or correcting existing artifacts requires a new version number. `edge` and `latest` are the intentionally moving aliases.
+
+If a runner is interrupted while GitHub still holds an incomplete draft Release, inspect and delete that draft before rerunning the same tag. The workflow intentionally refuses to overwrite or guess how to repair partial remote assets.
 
 Release downloads are built with `CGO_ENABLED=0` for the following targets:
 
@@ -170,7 +197,7 @@ git tag -a v1.0.0 -m 'v1.0.0'
 git push origin v1.0.0 # publishes the stable images and GitHub Release
 ```
 
-Protect `master`/`main` and the `v*` tag namespace with repository rulesets. Restrict changes to publishing workflows, release tag creation, and access to Docker Hub credentials to trusted maintainers. Enable Docker Hub tag immutability for the repository when that feature is available.
+Protect `master`/`main` and the `v*` tag namespace with repository rulesets. Restrict changes to publishing workflows, release tag creation, and access to Docker Hub credentials to trusted maintainers. If Docker Hub tag immutability rules are available, apply them only to exact SemVer tags; `latest` and `edge` must remain mutable.
 
 ## Quick Start
 

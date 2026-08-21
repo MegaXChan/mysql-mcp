@@ -24,7 +24,7 @@ export GOTOOLCHAIN VERSION COMMIT BINARY COVERAGE_FILE IMAGE TAG RELEASE_DIR TAR
 
 # Go source names conventionally contain no whitespace. Keeping this list in
 # make lets the formatting targets work with both BSD make and GNU make.
-GO_FILES := $(shell find cmd internal -type f -name '*.go' -print 2>/dev/null)
+GO_FILES := $(shell find cmd internal scripts -type f -name '*.go' -print 2>/dev/null)
 
 .DEFAULT_GOAL := help
 

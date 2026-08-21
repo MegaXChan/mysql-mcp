@@ -1,0 +1,11 @@
+# Use an allowlist so local credentials, IDE metadata, Git history, binaries,
+# coverage data, and developer-only configuration never enter the build context.
+**
+!Dockerfile
+!.dockerignore
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**

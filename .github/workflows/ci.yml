@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    # Tag builds are verified by release.yml before anything is published.
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+# The workflow only needs to read the checked-out repository. Keeping the
+# default token read-only limits the impact of third-party pull requests.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # setup-go installs the exact version declared by go.mod. Do not let the Go
+  # command silently download a different toolchain during verification.
+  GOTOOLCHAIN: local
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Show Go version
+        run: go version
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependency checksums
+        run: go mod verify
+
+      - name: Check module files are tidy
+        run: go mod tidy -diff
+
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          unformatted="$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "The following files are not formatted with gofmt:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests with race detector and coverage
+        run: go test -count=1 -race -covermode=atomic -coverprofile=coverage.out -timeout=10m ./...
+
+      - name: Print coverage summary
+        run: go tool cover -func=coverage.out
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build CLI
+        run: >-
+          go build -trimpath
+          -ldflags "-X main.version=ci-${GITHUB_SHA} -X main.commit=${GITHUB_SHA}"
+          -o "${RUNNER_TEMP}/mysql-mcp" ./cmd/mysql-mcp
+
+      - name: Smoke test CLI
+        shell: bash
+        run: |
+          "${RUNNER_TEMP}/mysql-mcp" --help
+          version_output="$("${RUNNER_TEMP}/mysql-mcp" --version)"
+          expected="mysql-mcp version ci-${GITHUB_SHA} (commit ${GITHUB_SHA})"
+          if [[ "${version_output}" != "${expected}" ]]; then
+            echo "unexpected version output: ${version_output}" >&2
+            exit 1
+          fi
+
+  fuzz:
+    name: Fuzz SQL policy
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run bounded SQL policy fuzzing
+        run: go test ./internal/policy -run '^$' -fuzz=FuzzValidateReadQuery -fuzztime=10s -timeout=5m
+
+  container:
+    name: Build container
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build runtime image
+        run: docker build --pull --build-arg VERSION="ci-${GITHUB_SHA}" --build-arg COMMIT="${GITHUB_SHA}" --tag mysql-mcp:ci .
+
+      - name: Verify non-root runtime user
+        shell: bash
+        run: |
+          runtime_user="$(docker image inspect mysql-mcp:ci --format '{{.Config.User}}')"
+          if [[ "${runtime_user}" != "65532:65532" ]]; then
+            echo "unexpected runtime user: ${runtime_user}"
+            exit 1
+          fi
+
+      - name: Smoke test container
+        run: docker run --rm mysql-mcp:ci --version

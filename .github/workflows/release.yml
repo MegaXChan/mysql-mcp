@@ -1,0 +1,381 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+
+# Publishing is deliberately unavailable to pull requests. Jobs use the
+# minimum permissions they need, and only the final GitHub Release job gets
+# write access to repository contents.
+permissions:
+  contents: read
+
+concurrency:
+  # master and main share the moving edge tag, so serialize their publications.
+  # Exact release tags keep independent groups because they never share tags.
+  group: publish-${{ github.ref_type == 'branch' && 'edge' || github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  IMAGE_NAME: megaxcn/mysql-mcp
+
+jobs:
+  validate:
+    name: Validate publish ref
+    if: github.repository == 'MegaXChan/mysql-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate release tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          semver_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          if [[ ! "${GITHUB_REF_NAME}" =~ ${semver_pattern} ]]; then
+            echo "release tags must be v-prefixed SemVer without build metadata; got ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+  verify:
+    name: Verify source
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run standard verification
+        run: make check COMMIT="${GITHUB_SHA}"
+
+      - name: Fuzz SQL policy boundary
+        run: make fuzz FUZZ_TIME=10s
+
+  binaries:
+    name: Package ${{ matrix.id }}
+    if: github.ref_type == 'tag'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-386
+            goos: linux
+            goarch: "386"
+            goarm: ""
+          - id: linux-amd64
+            goos: linux
+            goarch: amd64
+            goarm: ""
+          - id: linux-armv6
+            goos: linux
+            goarch: arm
+            goarm: "6"
+          - id: linux-armv7
+            goos: linux
+            goarch: arm
+            goarm: "7"
+          - id: linux-arm64
+            goos: linux
+            goarch: arm64
+            goarm: ""
+          - id: windows-386
+            goos: windows
+            goarch: "386"
+            goarm: ""
+          - id: windows-amd64
+            goos: windows
+            goarch: amd64
+            goarm: ""
+          - id: windows-arm64
+            goos: windows
+            goarch: arm64
+            goarm: ""
+          - id: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            goarm: ""
+          - id: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            goarm: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build release archive
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          OUT_DIR: dist
+        run: ./scripts/package-release.sh
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.id }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  docker:
+    name: Publish Docker image
+    needs:
+      - verify
+      - binaries
+    if: >-
+      always() &&
+      needs.verify.result == 'success' &&
+      (github.ref_type != 'tag' || needs.binaries.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Check Docker Hub credentials
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "configure the DOCKERHUB_USERNAME repository variable and DOCKERHUB_TOKEN repository secret"
+            exit 1
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The Dockerfile cross-compiles on BUILDPLATFORM, so target binaries are
+      # never executed during the build and QEMU is not required.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Select immutable release image tags
+        id: release-tags
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          inspect_dir="$(mktemp -d)"
+          trap 'rm -rf "${inspect_dir}"' EXIT
+
+          version_without_v="${RELEASE_TAG#v}"
+          missing_tags=()
+          existing_digest=""
+          inspect_index=0
+          for image_tag in "${RELEASE_TAG}" "${version_without_v}"; do
+            image_ref="${IMAGE_NAME}:${image_tag}"
+            manifest_file="${inspect_dir}/manifest-${inspect_index}.json"
+            error_file="${inspect_dir}/error-${inspect_index}.txt"
+            inspect_index=$((inspect_index + 1))
+
+            if docker buildx imagetools inspect --format '{{json .Manifest}}' "${image_ref}" >"${manifest_file}" 2>"${error_file}"; then
+              published_revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // ""' "${manifest_file}")"
+              published_digest="$(jq -r '.digest // ""' "${manifest_file}")"
+              if [[ -z "${published_revision}" ]]; then
+                echo "Docker tag exists without the trusted revision annotation: ${image_ref}"
+                exit 1
+              fi
+              if [[ "${published_revision}" != "${GITHUB_SHA}" ]]; then
+                echo "Docker tag already belongs to a different revision: ${image_ref}"
+                exit 1
+              fi
+              if [[ ! "${published_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "Docker tag has an invalid or missing manifest digest: ${image_ref}"
+                exit 1
+              fi
+              if [[ -n "${existing_digest}" && "${existing_digest}" != "${published_digest}" ]]; then
+                echo "Docker release aliases do not point to the same manifest digest"
+                exit 1
+              fi
+              existing_digest="${published_digest}"
+              echo "Docker tag already points to this revision; reusing it: ${image_ref}"
+              continue
+            fi
+
+            inspect_error="$(<"${error_file}")"
+            shopt -s nocasematch
+            if [[ "${inspect_error}" == *"${image_ref}: not found"* ||
+                  "${inspect_error}" =~ manifest[[:space:]]+unknown ||
+                  "${inspect_error}" =~ no[[:space:]]+such[[:space:]]+manifest ||
+                  "${inspect_error}" =~ manifest[^[:cntrl:]]*not[[:space:]]+found ||
+                  "${inspect_error}" =~ status[^[:cntrl:]]*404 ||
+                  "${inspect_error}" =~ 404[[:space:]]+not[[:space:]]+found ]]; then
+              missing_tags+=("${image_tag}")
+              shopt -u nocasematch
+            else
+              shopt -u nocasematch
+              echo "Could not safely determine whether Docker tag exists: ${image_ref}" >&2
+              printf '%s\n' "${inspect_error}" >&2
+              exit 1
+            fi
+          done
+
+          if (( ${#missing_tags[@]} == 0 )); then
+            echo "skip_push=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ -n "${existing_digest}" ]]; then
+            if (( ${#missing_tags[@]} != 1 )); then
+              echo "unexpected release-tag state while restoring Docker aliases" >&2
+              exit 1
+            fi
+            {
+              echo "skip_push=true"
+              echo "alias_source=${IMAGE_NAME}@${existing_digest}"
+              echo "alias_target=${IMAGE_NAME}:${missing_tags[0]}"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "skip_push=false"
+            echo "tags<<EOF"
+            for image_tag in "${missing_tags[@]}"; do
+              echo "${IMAGE_NAME}:${image_tag}"
+            done
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Restore a missing release image alias
+        if: github.ref_type == 'tag' && steps.release-tags.outputs.alias_target != ''
+        shell: bash
+        env:
+          ALIAS_SOURCE: ${{ steps.release-tags.outputs.alias_source }}
+          ALIAS_TARGET: ${{ steps.release-tags.outputs.alias_target }}
+        run: |
+          docker buildx imagetools create --tag "${ALIAS_TARGET}" "${ALIAS_SOURCE}"
+          restored_digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${ALIAS_TARGET}" | jq -r '.digest // ""')"
+          if [[ "${restored_digest}" != "${ALIAS_SOURCE##*@}" ]]; then
+            echo "restored Docker alias has an unexpected digest: ${ALIAS_TARGET}" >&2
+            exit 1
+          fi
+
+      - name: Select embedded version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="edge-${GITHUB_SHA:0:12}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref_type == 'branch' }}
+            type=sha,prefix=sha-,enable=${{ github.ref_type == 'branch' }}
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+
+      - name: Build and push multi-platform image
+        if: github.ref_type != 'tag' || steps.release-tags.outputs.skip_push != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+          tags: ${{ github.ref_type == 'tag' && steps.release-tags.outputs.tags || steps.meta.outputs.tags }}
+          annotations: |
+            index:org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=mysql-mcp-publish
+          cache-to: type=gha,mode=max,scope=mysql-mcp-publish
+
+  github-release:
+    name: Create GitHub Release
+    if: github.ref_type == 'tag'
+    needs:
+      - binaries
+      - docker
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          export LC_ALL=C
+          sha256sum mysql-mcp_* > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "GitHub Release already exists and will not be overwritten: ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          release_flags=()
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release create "${RELEASE_TAG}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --title "${RELEASE_TAG}" \
+            "${release_flags[@]}"

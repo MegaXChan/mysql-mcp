@@ -1,0 +1,149 @@
+# mysql-mcp 配置版本；当前只支持 1。
+version: 1
+
+server:
+  # stdio 或 http。HTTP 会同时发布全部数据源；stdio 需使用
+  # `mysql-mcp serve --config config.yaml --datasource <name>` 绑定一个数据源。
+  transport: http
+
+  # 安全默认值。为 true 时不能开启任何会改变状态的 feature。
+  read_only: true
+
+  http:
+    listen: "127.0.0.1:8080"
+    auth:
+      # none 或 token。远程部署建议 token，并在外层使用 HTTPS。
+      mode: token
+      # token 模式下 token_env 与 token_file 必须且只能配置一个。
+      token_env: MYSQL_MCP_HTTP_TOKEN
+      # token_file: secrets/http-token
+
+  # 所有写能力默认关闭。开启任一项前，必须把 server.read_only 改为 false，
+  # 目标数据源的 read_only 也必须为 false，并配置 credentials.write。
+  features:
+    dml: false
+    ddl: false
+    admin: false
+    function_write: false
+
+  limits:
+    query_timeout: 10s
+    max_sql_bytes: 64KiB
+    default_rows: 200
+    max_rows: 1000
+    max_result_bytes: 1MiB
+    max_concurrency_per_source: 4
+
+datasources:
+  # MySQL 5.7 示例。版本由服务启动时探测，不在配置中手工声明。
+  - name: orders57
+    network: tcp
+    address: "mysql57.internal.example:3306"
+    default_database: orders
+
+    # 数据源级只读只能收紧全局策略。即使以后全局允许写，这个数据源仍只读。
+    read_only: true
+    allowed_schemas:
+      - orders
+      - orders_archive
+
+    credentials:
+      # read 必填；密码不能直接写入 YAML。
+      read:
+        username: mysql_mcp_orders_read
+        password_env: ORDERS57_READ_PASSWORD
+
+      # write 只在对应写 feature 开启且数据源非只读时使用。不需要写时应省略。
+      # write:
+      #   username: mysql_mcp_orders_write
+      #   password_env: ORDERS57_WRITE_PASSWORD
+
+      # monitor 可选。省略时监控回退到 read 账号；生产环境建议独立账号。
+      monitor:
+        username: mysql_mcp_orders_monitor
+        password_env: ORDERS57_MONITOR_PASSWORD
+
+    tls:
+      # disabled、preferred、required、verify-ca 或 verify-full。
+      mode: required
+      # required 加密但不校验证书身份；生产环境优先使用 verify-full。
+
+    pool:
+      max_open: 10
+      max_idle: 5
+      conn_max_lifetime: 30m
+      conn_max_idle_time: 5m
+
+    monitoring:
+      enabled: true
+      sessions: true
+      locks: true
+      top_queries: true
+      replication: true
+      innodb_status: false
+      query_timeout: 5s
+
+    # 这里只允许 MySQL 存储函数，不包括存储过程和 loadable/native UDF。
+    functions:
+      - name: orders.calculate_discount
+        effect: read
+        allow_definer: false
+
+  # MySQL 8.0 示例。每个数据源都有独立的 URL、连接池、权限和函数 allowlist。
+  - name: analytics8
+    network: tcp
+    address: "mysql8.internal.example:3306"
+    default_database: analytics
+    read_only: true
+    allowed_schemas:
+      - analytics
+
+    credentials:
+      read:
+        username: mysql_mcp_analytics_read
+        password_env: ANALYTICS8_READ_PASSWORD
+      # 默认只读配置不解析或打开写凭据。开启写能力时再取消注释。
+      # write:
+      #   username: mysql_mcp_analytics_write
+      #   password_env: ANALYTICS8_WRITE_PASSWORD
+      monitor:
+        username: mysql_mcp_analytics_monitor
+        password_env: ANALYTICS8_MONITOR_PASSWORD
+
+    tls:
+      # verify-full 校验证书链和主机名，是生产环境推荐模式。
+      mode: verify-full
+      # 相对路径以本配置文件所在目录为基准。
+      ca_file: certs/mysql-ca.pem
+      cert_file: certs/mysql-mcp-client.pem
+      key_file: certs/mysql-mcp-client-key.pem
+      server_name: mysql8.internal.example
+
+    pool:
+      max_open: 20
+      max_idle: 10
+      conn_max_lifetime: 30m
+      conn_max_idle_time: 5m
+
+    monitoring:
+      enabled: true
+      sessions: true
+      locks: true
+      top_queries: true
+      replication: false
+      innodb_status: false
+      query_timeout: 5s
+
+    functions:
+      - name: analytics.normalize_score
+        effect: read
+        allow_definer: false
+
+      # 写函数示例（默认保持注释）：
+      # 1. server.read_only: false
+      # 2. server.features.function_write: true
+      # 3. 本数据源 read_only: false
+      # 4. 写账号仅授予该函数所需的 EXECUTE/表权限
+      # - name: analytics.refresh_customer_segment
+      #   effect: write
+      #   allow_definer: false

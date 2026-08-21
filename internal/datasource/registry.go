@@ -13,6 +13,7 @@ import (
 	"github.com/MegaXChan/mysql-mcp/internal/config"
 	"github.com/MegaXChan/mysql-mcp/internal/database"
 	"github.com/MegaXChan/mysql-mcp/internal/policy"
+	"github.com/MegaXChan/mysql-mcp/internal/schemafilter"
 )
 
 const performanceSchemaQuery = "SELECT @@performance_schema"
@@ -31,20 +32,21 @@ type Services struct {
 // Source is a fully initialized data source. It owns separate pools for read,
 // write, and monitoring credentials where configured.
 type Source struct {
-	Name             string
-	DefaultDatabase  string
-	AllowedSchemas   []string
-	ReadOnly         bool
-	Features         config.FeatureConfig
-	Monitoring       config.Monitoring
-	Version          Version
-	Policy           *policy.Policy
-	Services         Services
-	DefaultRows      int
-	MaxRows          int
-	MaxSQLBytes      int64
-	FunctionCount    int
-	HasWriteFunction bool
+	Name                  string
+	DefaultDatabase       string
+	AllowedSchemas        []string
+	AllowedSchemaPatterns []string
+	ReadOnly              bool
+	Features              config.FeatureConfig
+	Monitoring            config.Monitoring
+	Version               Version
+	Policy                *policy.Policy
+	Services              Services
+	DefaultRows           int
+	MaxRows               int
+	MaxSQLBytes           int64
+	FunctionCount         int
+	HasWriteFunction      bool
 
 	readDB    *sql.DB
 	writeDB   *sql.DB
@@ -70,20 +72,12 @@ func (s *Source) Acquire(ctx context.Context) (func(), error) {
 	}
 }
 
-// SchemaAllowed checks the configuration allow list exactly. MySQL database
-// name case sensitivity varies by host platform, so case-folding here could
-// authorize a distinct schema on a case-sensitive server. An empty allow list
-// intentionally means all schemas visible to the role account.
+// SchemaAllowed checks exact names and anchored glob patterns. MySQL database
+// name case sensitivity varies by host platform, so matching remains
+// case-sensitive to avoid authorizing a distinct schema. Both lists being
+// empty intentionally means all schemas visible to the role account.
 func (s *Source) SchemaAllowed(schema string) bool {
-	if len(s.AllowedSchemas) == 0 {
-		return true
-	}
-	for _, allowed := range s.AllowedSchemas {
-		if allowed == schema {
-			return true
-		}
-	}
-	return false
+	return schemafilter.Allows(schema, s.AllowedSchemas, s.AllowedSchemaPatterns)
 }
 
 // Close releases every distinct pool owned by this source.
@@ -169,17 +163,18 @@ func openSource(
 	options RegistryOptions,
 ) (_ *Source, err error) {
 	source := &Source{
-		Name:            datasourceConfig.Name,
-		DefaultDatabase: datasourceConfig.DefaultDatabase,
-		AllowedSchemas:  append([]string(nil), datasourceConfig.AllowedSchemas...),
-		ReadOnly:        cfg.EffectiveReadOnly(datasourceConfig),
-		Features:        cfg.Server.Features,
-		Monitoring:      datasourceConfig.Monitoring,
-		DefaultRows:     cfg.Server.Limits.DefaultRows,
-		MaxRows:         cfg.Server.Limits.MaxRows,
-		MaxSQLBytes:     cfg.Server.Limits.MaxSQLBytes.Bytes(),
-		FunctionCount:   len(datasourceConfig.Functions),
-		limiter:         make(chan struct{}, cfg.Server.Limits.MaxConcurrencyPerSource),
+		Name:                  datasourceConfig.Name,
+		DefaultDatabase:       datasourceConfig.DefaultDatabase,
+		AllowedSchemas:        append([]string(nil), datasourceConfig.AllowedSchemas...),
+		AllowedSchemaPatterns: append([]string(nil), datasourceConfig.AllowedSchemaPatterns...),
+		ReadOnly:              cfg.EffectiveReadOnly(datasourceConfig),
+		Features:              cfg.Server.Features,
+		Monitoring:            datasourceConfig.Monitoring,
+		DefaultRows:           cfg.Server.Limits.DefaultRows,
+		MaxRows:               cfg.Server.Limits.MaxRows,
+		MaxSQLBytes:           cfg.Server.Limits.MaxSQLBytes.Bytes(),
+		FunctionCount:         len(datasourceConfig.Functions),
+		limiter:               make(chan struct{}, cfg.Server.Limits.MaxConcurrencyPerSource),
 	}
 	defer func() {
 		if err != nil {

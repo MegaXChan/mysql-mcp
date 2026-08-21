@@ -8,15 +8,16 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/MegaXChan/mysql-mcp/internal/schemafilter"
 )
 
 const (
-	listSchemasSQL = `SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
+	listSchemasSelect = `SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
 FROM INFORMATION_SCHEMA.SCHEMATA
-ORDER BY SCHEMA_NAME`
-	listSchemasFilteredPrefix = `SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
-FROM INFORMATION_SCHEMA.SCHEMATA
-WHERE SCHEMA_NAME IN (`
+`
+	listSchemasSQL            = listSchemasSelect + `ORDER BY SCHEMA_NAME`
+	listSchemasFilteredPrefix = listSchemasSelect + `WHERE BINARY SCHEMA_NAME IN (`
 
 	listTablesSQL = `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS,
        DATA_LENGTH, INDEX_LENGTH, TABLE_COLLATION, TABLE_COMMENT
@@ -156,19 +157,44 @@ func (s *MetadataService) ListSchemas(ctx context.Context) ([]SchemaInfo, error)
 // the row bound. Filtering only after a bounded unfiltered query could omit an
 // allowed schema that sorts after many disallowed schemas.
 func (s *MetadataService) ListSchemasFiltered(ctx context.Context, names []string) ([]SchemaInfo, error) {
-	if len(names) == 0 {
+	return s.ListSchemasAllowed(ctx, names, nil)
+}
+
+// ListSchemasAllowed applies exact names and anchored glob patterns in MySQL
+// before the row bound. Pattern values are converted to LIKE data and passed
+// as query parameters; they are never interpolated into SQL syntax. BINARY
+// keeps authorization case-sensitive on every supported MySQL host.
+func (s *MetadataService) ListSchemasAllowed(
+	ctx context.Context,
+	names []string,
+	patterns []string,
+) ([]SchemaInfo, error) {
+	if !schemafilter.Restricted(names, patterns) {
 		return s.ListSchemas(ctx)
 	}
-	args := make([]any, len(names))
-	placeholders := make([]string, len(names))
-	for index, name := range names {
-		if err := validateIdentifier("schema", name); err != nil {
-			return nil, err
+
+	clauses := make([]string, 0, 1+len(patterns))
+	args := make([]any, 0, len(names)+len(patterns))
+	if len(names) > 0 {
+		placeholders := make([]string, len(names))
+		for index, name := range names {
+			if err := validateIdentifier("schema", name); err != nil {
+				return nil, err
+			}
+			args = append(args, name)
+			placeholders[index] = "?"
 		}
-		args[index] = name
-		placeholders[index] = "?"
+		clauses = append(clauses, "BINARY SCHEMA_NAME IN ("+strings.Join(placeholders, ",")+")")
 	}
-	statement := listSchemasFilteredPrefix + strings.Join(placeholders, ",") + ")\nORDER BY SCHEMA_NAME"
+	for index, pattern := range patterns {
+		if err := schemafilter.Validate(pattern); err != nil {
+			return nil, invalid("list schemas", fmt.Sprintf("invalid schema pattern at index %d: %v", index, err))
+		}
+		clauses = append(clauses, "BINARY SCHEMA_NAME LIKE BINARY ? ESCAPE '='")
+		args = append(args, schemafilter.ToSQLLike(pattern))
+	}
+
+	statement := listSchemasSelect + "WHERE " + strings.Join(clauses, " OR ") + "\nORDER BY SCHEMA_NAME"
 	return s.listSchemas(ctx, statement, args)
 }
 

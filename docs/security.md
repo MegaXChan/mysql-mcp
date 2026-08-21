@@ -27,7 +27,7 @@
 2. 使用 SQL-aware splitter 确认只有一个非空语句；字符串中的分号不会误判为分隔符。
 3. 解析完整 AST，按根节点分类为 read、write、DDL、transaction、session、admin、stored program 等类别。
 4. 递归检查子节点，拒绝锁定读、`SELECT INTO`、变量赋值、序列推进、危险函数和未知函数。
-5. 验证请求 AST 中的直接物理表引用是否属于 `allowed_schemas`。
+5. 验证请求 AST 中的直接物理表引用是否匹配 `allowed_schemas` 或 `allowed_schema_patterns`。
 
 这会覆盖诸如 `WITH ... UPDATE`、注释隐藏关键字、嵌套危险函数等仅看首个 token 无法正确判定的情况。
 
@@ -60,9 +60,11 @@ server.read_only OR datasource.read_only
 
 存储函数的 `effect` 是部署方作出的安全声明。服务会用 MySQL 的 `SQL DATA ACCESS` 元数据做冲突检查，但该声明本身不是可信沙箱。所有 allowlist 函数都需要代码审查；`allow_definer: true` 尤其需要审查 DEFINER 账号及其权限。
 
-`allowed_schemas` 是请求文本的直接引用策略，不是数据库对象依赖分析器。`SQL SECURITY DEFINER` 视图可能借用定义者权限访问 allowlist 外对象或调用函数。需要强隔离时，应使用表级授权，只为逐个审计过的视图单独授权，并优先采用 `SQL SECURITY INVOKER`；不要把 `GRANT SELECT ON schema.*` 当成租户沙箱。
+`allowed_schemas` 使用完整 schema 名字面匹配；`allowed_schema_patterns` 的每项必须至少包含一个 `*`，使用锚定到完整 schema 名的 Glob 匹配，只有 `*` 能匹配任意数量（包括零个）字符，其他字符均按字面值处理。两者都严格区分大小写，schema 匹配任一列表即可允许；两个列表都为空时不增加应用层 schema 限制。未限定 schema 的物理表会归属于 `default_database`，并按相同的合并规则检查。
 
-监控服务有意提供实例级运维视角。会话、锁、digest、InnoDB 状态和复制输出可能包含 `allowed_schemas` 之外的对象名或 SQL 文本，且部分输出无法可靠归属到单个 schema。应把启用监控及监控账号权限视作独立授权边界，不应与租户级查询 Token 共用。
+这两个列表是请求文本的直接引用策略，不是数据库对象依赖分析器。`SQL SECURITY DEFINER` 视图可能借用定义者权限访问 allowlist 外对象或调用函数。需要强隔离时，应使用表级授权，只为逐个审计过的视图单独授权，并优先采用 `SQL SECURITY INVOKER`；不要把 `GRANT SELECT ON schema.*` 当成租户沙箱。无论名称或模式是否匹配，MySQL 账号的实际 `GRANT` 权限始终是最终的数据库授权边界。
+
+监控服务有意提供实例级运维视角。会话、锁、digest、InnoDB 状态和复制输出可能包含 `allowed_schemas` 与 `allowed_schema_patterns` 授权范围之外的对象名或 SQL 文本，且部分输出无法可靠归属到单个 schema。应把启用监控及监控账号权限视作独立授权边界，不应与租户级查询 Token 共用。
 
 ## HTTP 安全
 
@@ -76,16 +78,21 @@ Bearer Token 模式提供单个共享凭据的认证，不提供：
 
 因此，非本机部署应在前置代理终止 HTTPS，并结合身份认证、网络 allowlist、速率限制和审计日志。若在非回环监听器上使用 `mode: none`，服务会产生安全告警。
 
-健康检查不需要 Token，但只返回固定的存活/就绪文本。不要在代理层把其他路径重写到 `/healthz` 或 `/readyz`。
+`GET /healthz` 是存活检查并返回 `200 OK`。`GET /readyz` 是就绪检查，服务正常接受请求时返回 `200 OK`，关闭过程中返回 `503 Service Unavailable`。两者无需 Token，只返回固定文本；不要在代理层把其他路径重写到这些端点。健康与就绪请求被有意排除在请求日志之外，避免高频探针产生噪声。
+
+除健康检查外，每个已完成的 HTTP 请求都会记录 `method`、`path`、`status`、`response_bytes`、`duration_ms`、`remote_addr`、`request_id`，并在响应的 `X-Request-ID` Header 中返回关联标识。日志不包含 query string、`Authorization` 或 Token、任何请求/响应 Header、body、SQL。
+
+`remote_addr` 只表示应用 TCP 连接的直接对端。通过反向代理部署时通常记录的是代理地址；服务不信任 `X-Forwarded-For` 等转发地址 Header。若需要可信的原始客户端地址，应由正确配置受信任代理链的边界日志负责记录，不能把任意客户端提供的 XFF 当作身份或审计依据。
 
 HTTP 服务限制 Header、请求体总大小和读取时间；客户端必须在 30 秒内完成请求读取。响应写入超时为查询超时再加固定编码余量。外层代理仍应设置连接数、请求速率和更靠近网络边界的超时。
 
 ## 密钥处理
 
-- 配置不接受明文 password/token 字段，只接受环境变量名或文件路径。
-- 同一个密钥只能选择一个来源，环境变量名会校验格式。
+- 数据库凭据首选 `password: ${ENV_NAME}`。只有整个 scalar 精确符合合法环境变量名的 `${...}` 形式时，应用才读取环境变量；变量缺失或为空会导致配置加载和服务启动失败。
+- 其他非空 `password` scalar 作为明文密码原样使用，不执行 shell/YAML 插值、拼接或 default 展开。明文虽受支持，但强烈不建议写入配置或提交 Git。
+- 每个数据库凭据必须在 `password`、兼容字段 `password_env`、`password_file` 中三选一。HTTP Token 仍在 `token_env`、`token_file` 中二选一。
 - 相对文件路径以配置文件目录为基准。
-- 日志格式化配置对象时会脱敏已解析的密钥。
+- 日志和诊断格式化配置对象时会脱敏已解析的密钥。
 - 不应把密钥放进 CLI 参数，因为参数通常可被同机进程和运维系统观察。
 
 部署方应使用 secret manager 注入、限制文件权限、定期轮换，并确保错误日志和反向代理日志不记录 `Authorization` 请求头。

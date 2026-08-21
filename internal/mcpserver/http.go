@@ -31,18 +31,14 @@ func NewHTTPHandler(endpoints map[string]http.Handler, options HTTPOptions) (htt
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
+		writeProbeResponse(w, http.StatusOK, "ok\n")
 	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if options.Ready != nil && !options.Ready() {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			writeProbeResponse(w, http.StatusServiceUnavailable, "not ready\n")
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready\n"))
+		writeProbeResponse(w, http.StatusOK, "ready\n")
 	})
 
 	authenticate := AuthMiddleware(options.AuthMode, options.Token)
@@ -56,6 +52,17 @@ func NewHTTPHandler(endpoints map[string]http.Handler, options HTTPOptions) (htt
 		mux.Handle("/"+name+"/mcp", authenticate(endpoint))
 	}
 	return mux, nil
+}
+
+func writeProbeResponse(w http.ResponseWriter, status int, body string) {
+	// A cached readiness response can keep routing traffic to a process that is
+	// already shutting down. Probes are intentionally small, unauthenticated,
+	// and metadata-free.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
 }
 
 func validateDatasourcePathName(name string) error {

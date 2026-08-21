@@ -1,11 +1,12 @@
 // Package config loads and validates mysql-mcp configuration files.
 //
 // The package deliberately keeps resolved passwords and bearer tokens out of
-// YAML and JSON serialization. Callers can obtain them through Password and
-// Token after Load has resolved the configured environment variable or file.
+// YAML and JSON serialization. Callers can obtain effective values through
+// Password and Token after Load has resolved the configured secret source.
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -107,17 +108,18 @@ type LimitConfig struct {
 // DatasourceConfig is one independently-addressable MySQL server. Name is also
 // the single URL segment used by /{datasource_name}/mcp.
 type DatasourceConfig struct {
-	Name            string          `yaml:"name" json:"name"`
-	Network         string          `yaml:"network" json:"network"`
-	Address         string          `yaml:"address" json:"address"`
-	DefaultDatabase string          `yaml:"default_database,omitempty" json:"default_database,omitempty"`
-	ReadOnly        bool            `yaml:"read_only" json:"read_only"`
-	AllowedSchemas  []string        `yaml:"allowed_schemas,omitempty" json:"allowed_schemas,omitempty"`
-	Credentials     Credentials     `yaml:"credentials" json:"credentials"`
-	TLS             TLS             `yaml:"tls" json:"tls"`
-	Pool            Pool            `yaml:"pool" json:"pool"`
-	Monitoring      Monitoring      `yaml:"monitoring" json:"monitoring"`
-	Functions       []FunctionAllow `yaml:"functions,omitempty" json:"functions,omitempty"`
+	Name                  string          `yaml:"name" json:"name"`
+	Network               string          `yaml:"network" json:"network"`
+	Address               string          `yaml:"address" json:"address"`
+	DefaultDatabase       string          `yaml:"default_database,omitempty" json:"default_database,omitempty"`
+	ReadOnly              bool            `yaml:"read_only" json:"read_only"`
+	AllowedSchemas        []string        `yaml:"allowed_schemas,omitempty" json:"allowed_schemas,omitempty"`
+	AllowedSchemaPatterns []string        `yaml:"allowed_schema_patterns,omitempty" json:"allowed_schema_patterns,omitempty"`
+	Credentials           Credentials     `yaml:"credentials" json:"credentials"`
+	TLS                   TLS             `yaml:"tls" json:"tls"`
+	Pool                  Pool            `yaml:"pool" json:"pool"`
+	Monitoring            Monitoring      `yaml:"monitoring" json:"monitoring"`
+	Functions             []FunctionAllow `yaml:"functions,omitempty" json:"functions,omitempty"`
 }
 
 // Credentials separates least-privilege accounts by responsibility. Read is
@@ -129,11 +131,15 @@ type Credentials struct {
 	Monitor Credential `yaml:"monitor,omitempty" json:"monitor,omitempty"`
 }
 
-// Credential references a password without placing it directly in YAML.
+// Credential configures a password. PasswordValue is populated by the `password`
+// field: an exact ${ENV_NAME} value references the environment, while any other
+// non-empty value is a literal password. PasswordEnv and PasswordFile remain
+// available for backward compatibility.
 type Credential struct {
-	Username     string `yaml:"username" json:"username"`
-	PasswordEnv  string `yaml:"password_env,omitempty" json:"password_env,omitempty"`
-	PasswordFile string `yaml:"password_file,omitempty" json:"password_file,omitempty"`
+	Username      string `yaml:"username" json:"username"`
+	PasswordValue string `yaml:"password,omitempty" json:"password,omitempty"`
+	PasswordEnv   string `yaml:"password_env,omitempty" json:"password_env,omitempty"`
+	PasswordFile  string `yaml:"password_file,omitempty" json:"password_file,omitempty"`
 
 	password string
 }
@@ -143,16 +149,43 @@ func (c Credential) Password() string { return c.password }
 
 // Configured reports whether any field for this optional credential was set.
 func (c Credential) Configured() bool {
-	return c.Username != "" || c.PasswordEnv != "" || c.PasswordFile != "" || c.password != ""
+	return c.Username != "" || c.PasswordValue != "" || c.PasswordEnv != "" || c.PasswordFile != "" || c.password != ""
 }
 
 // String prevents accidental password disclosure through ordinary logging.
 func (c Credential) String() string {
-	return fmt.Sprintf("{Username:%q PasswordEnv:%q PasswordFile:%q Password:<redacted>}", c.Username, c.PasswordEnv, c.PasswordFile)
+	return fmt.Sprintf("{Username:%q Password:%q PasswordEnv:%q PasswordFile:%q ResolvedPassword:<redacted>}", c.Username, c.safePasswordValue(), c.PasswordEnv, c.PasswordFile)
 }
 
 // GoString makes %#v formatting safe as well as ordinary String formatting.
 func (c Credential) GoString() string { return c.String() }
+
+// MarshalYAML preserves auditable environment references but masks literal
+// passwords. This protects direct serialization as well as Config.String.
+func (c Credential) MarshalYAML() (any, error) {
+	type credentialAlias Credential
+	safe := credentialAlias(c)
+	safe.PasswordValue = c.safePasswordValue()
+	return safe, nil
+}
+
+// MarshalJSON applies the same literal-password masking as MarshalYAML.
+func (c Credential) MarshalJSON() ([]byte, error) {
+	type credentialAlias Credential
+	safe := credentialAlias(c)
+	safe.PasswordValue = c.safePasswordValue()
+	return json.Marshal(safe)
+}
+
+func (c Credential) safePasswordValue() string {
+	if c.PasswordValue == "" {
+		return ""
+	}
+	if _, environmentReference := passwordReferenceEnvironment(c.PasswordValue); environmentReference {
+		return c.PasswordValue
+	}
+	return "<redacted>"
+}
 
 // TLS configures encryption for a data-source connection.
 type TLS struct {

@@ -43,25 +43,34 @@ datasources:
 
     # 数据源级只读只能收紧全局策略。即使以后全局允许写，这个数据源仍只读。
     read_only: true
+    # 精确名称与 Glob 模式按“任一匹配即允许”组合。模式匹配完整 schema 名，
+    # 区分大小写且只有 * 是通配符；default_database 也必须满足相同规则。
     allowed_schemas:
       - orders
       - orders_archive
+    # allowed_schema_patterns:
+    #   - "*_dev"
+    # 两个列表都为空时不增加应用层 schema 限制；MySQL GRANT 仍是最终权限边界。
 
     credentials:
-      # read 必填；密码不能直接写入 YAML。
+      # read 必填。password 首选应用解析的严格整值 ${ENV_NAME} 引用；
+      # 只有精确符合该形式时才读取环境变量，变量缺失或为空时启动失败。
+      # 其他非空 scalar 会作为明文密码原样使用，虽受支持但强烈不建议提交 Git。
+      # password、password_env、password_file 必须三选一。后两者继续兼容；
+      # 使用文件 secret 时，可改为 password_file: secrets/orders57-read-password。
       read:
         username: mysql_mcp_orders_read
-        password_env: ORDERS57_READ_PASSWORD
+        password: ${ORDERS57_READ_PASSWORD}
 
       # write 只在对应写 feature 开启且数据源非只读时使用。不需要写时应省略。
       # write:
       #   username: mysql_mcp_orders_write
-      #   password_env: ORDERS57_WRITE_PASSWORD
+      #   password: ${ORDERS57_WRITE_PASSWORD}
 
       # monitor 可选。省略时监控回退到 read 账号；生产环境建议独立账号。
       monitor:
         username: mysql_mcp_orders_monitor
-        password_env: ORDERS57_MONITOR_PASSWORD
+        password: ${ORDERS57_MONITOR_PASSWORD}
 
     tls:
       # disabled、preferred、required、verify-ca 或 verify-full。
@@ -101,14 +110,14 @@ datasources:
     credentials:
       read:
         username: mysql_mcp_analytics_read
-        password_env: ANALYTICS8_READ_PASSWORD
+        password: ${ANALYTICS8_READ_PASSWORD}
       # 默认只读配置不解析或打开写凭据。开启写能力时再取消注释。
       # write:
       #   username: mysql_mcp_analytics_write
-      #   password_env: ANALYTICS8_WRITE_PASSWORD
+      #   password: ${ANALYTICS8_WRITE_PASSWORD}
       monitor:
         username: mysql_mcp_analytics_monitor
-        password_env: ANALYTICS8_MONITOR_PASSWORD
+        password: ${ANALYTICS8_MONITOR_PASSWORD}
 
     tls:
       # verify-full 校验证书链和主机名，是生产环境推荐模式。

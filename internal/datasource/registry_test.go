@@ -159,6 +159,36 @@ func TestSourceAcquireHonorsConcurrencyAndCancellation(t *testing.T) {
 	secondRelease()
 }
 
+func TestSourceSchemaAllowedCombinesExactNamesAndPatterns(t *testing.T) {
+	t.Parallel()
+
+	// Exact entries and anchored globs form one allow-list. Matching remains
+	// case-sensitive so a Linux MySQL host cannot confuse two distinct schema
+	// names. Both lists empty retains the documented unrestricted behavior.
+	source := &Source{
+		AllowedSchemas:        []string{"shared"},
+		AllowedSchemaPatterns: []string{"*_dev"},
+	}
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "shared", want: true},
+		{name: "orders_dev", want: true},
+		{name: "_dev", want: true},
+		{name: "orders_prod", want: false},
+		{name: "ORDERS_DEV", want: false},
+	}
+	for _, test := range tests {
+		if got := source.SchemaAllowed(test.name); got != test.want {
+			t.Errorf("SchemaAllowed(%q) = %v, want %v", test.name, got, test.want)
+		}
+	}
+	if got := (&Source{}).SchemaAllowed("anything"); !got {
+		t.Fatal("SchemaAllowed() with no exact names or patterns = false, want unrestricted")
+	}
+}
+
 func registryTestConfig(names ...string) config.Config {
 	cfg := config.Defaults()
 	for _, name := range names {

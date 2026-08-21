@@ -47,17 +47,19 @@ type tableDescriptionOutput struct {
 func registerMetadataTools(server *mcp.Server, source *datasource.Source) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "mysql.metadata.schemas",
-		Description: "List visible schemas, filtered by this datasource's allowed_schemas policy.",
+		Description: "List visible schemas filtered by this datasource's exact-name and Glob allow-list policy.",
 		Annotations: readOnlyAnnotations(),
 	}, guarded(source, func(ctx context.Context, _ struct{}) (schemasOutput, error) {
 		var (
 			schemas []database.SchemaInfo
 			err     error
 		)
-		if len(source.AllowedSchemas) == 0 {
+		if len(source.AllowedSchemas) == 0 && len(source.AllowedSchemaPatterns) == 0 {
 			schemas, err = source.Services.Metadata.ListSchemas(ctx)
 		} else {
-			schemas, err = source.Services.Metadata.ListSchemasFiltered(ctx, source.AllowedSchemas)
+			schemas, err = source.Services.Metadata.ListSchemasAllowed(
+				ctx, source.AllowedSchemas, source.AllowedSchemaPatterns,
+			)
 		}
 		if err != nil {
 			return schemasOutput{}, err

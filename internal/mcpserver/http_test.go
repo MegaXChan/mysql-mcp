@@ -78,10 +78,16 @@ func TestNewHTTPHandlerProtectsOnlyMCPRoutes(t *testing.T) {
 	if health.Code != http.StatusOK {
 		t.Errorf("health status = %d, want %d", health.Code, http.StatusOK)
 	}
+	if health.Body.String() != "ok\n" || health.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("health response = body %q headers %v, want fixed non-cacheable response", health.Body.String(), health.Header())
+	}
 	ready := httptest.NewRecorder()
 	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if ready.Code != http.StatusServiceUnavailable {
 		t.Errorf("readiness status = %d, want %d", ready.Code, http.StatusServiceUnavailable)
+	}
+	if ready.Body.String() != "not ready\n" || ready.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("readiness response = body %q headers %v, want fixed non-cacheable response", ready.Body.String(), ready.Header())
 	}
 }
 

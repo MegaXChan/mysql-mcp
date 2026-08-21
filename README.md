@@ -114,6 +114,8 @@ curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/readyz
 ```
 
+`GET /healthz` is the liveness probe and returns `200 OK`. `GET /readyz` returns `200 OK` while the process is ready and `503 Service Unavailable` during shutdown. Neither endpoint requires a Token, and both are deliberately excluded from request logs to avoid continuous probe noise.
+
 ## Releases
 
 Publishing is driven by [the Publish workflow](.github/workflows/release.yml). Every branch or tag selected for publishing must pass the standard verification and bounded SQL policy fuzz test before any artifact is uploaded.
@@ -191,6 +193,19 @@ Validate the configuration before starting the server:
 ```
 
 `validate-config` performs strict configuration validation and resolves secret references, so every referenced environment variable or secret file must exist. It never prints passwords or Tokens in its output.
+
+The preferred database-password form is an environment reference in the `password` field:
+
+```yaml
+credentials:
+  read:
+    username: mysql_mcp_orders_read
+    password: ${ORDERS57_READ_PASSWORD}
+```
+
+Only a complete scalar that is exactly `${ENV_NAME}`, with a valid environment-variable name, triggers environment lookup by `mysql-mcp`. It is not shell, YAML, or general-purpose template expansion. Startup and `validate-config` fail if that exact reference names a missing or empty variable. Every other non-empty scalar is used verbatim as a plaintext password; forms such as `prefix-${ENV_NAME}` or `${ENV_NAME:-default}` have no interpolation or default semantics and are literal password text.
+
+Each database credential must configure exactly one of `password`, the compatible `password_env: ENV_NAME` form, or `password_file: path/to/secret`. Relative secret-file paths are resolved from the configuration file's directory. File-based secrets remain useful when a container or orchestrator mounts a secret as a read-only file; do not configure a second password source alongside them. Plaintext `password` values are supported but should never be committed to Git; resolved passwords are redacted from configuration diagnostics.
 
 The example configuration defines two data sources, `orders57` and `analytics8`, with the following HTTP endpoints:
 
@@ -282,6 +297,14 @@ Relative secret file paths are resolved from the directory containing the config
 
 > `datasources[].tls` protects only the connection from the server to MySQL; it does not enable HTTPS on the MCP HTTP listener.
 
+## HTTP Health Checks and Request Logging
+
+`GET /healthz` is the liveness endpoint and returns `200 OK`. `GET /readyz` is the readiness endpoint: it returns `200 OK` while the service accepts work and `503 Service Unavailable` during shutdown. Both routes bypass Token authentication. Health and readiness requests are intentionally not logged, which keeps frequent orchestrator probes from overwhelming operational logs.
+
+Every other completed HTTP request produces a structured log entry containing only `method`, `path`, `status`, `response_bytes`, `duration_ms`, `remote_addr`, and `request_id`. The response carries the corresponding identifier in `X-Request-ID` for correlation.
+
+The request logger does not record the query string, `Authorization` value or Token, any request or response headers, the body, or SQL. `remote_addr` is Go's direct peer address. Behind a reverse proxy it therefore identifies the proxy, not the original client; the service deliberately does not trust `X-Forwarded-For` or similar forwarded-address headers.
+
 ## Read-only and Write Capabilities
 
 The default configuration is equivalent to:
@@ -372,7 +395,7 @@ MySQL's `SQL DATA ACCESS` declaration is primarily metadata and does not replace
 Each `datasources[]` entry independently configures:
 
 - URL name, network address, and default database;
-- schema allowlist;
+- literal and Glob-pattern schema allowlists;
 - read/write/monitor credentials;
 - TLS and connection pools;
 - monitoring capabilities;
@@ -381,6 +404,24 @@ Each `datasources[]` entry independently configures:
 Data source names must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, making them safe for use as a single URL path segment. Names must be unique within a configuration.
 
 At startup, the server reads the actual MySQL version, accepts only 5.7.x and 8.x, and creates the corresponding Vitess parser version for each data source. Monitoring queries account for major version differences, including MySQL 5.7's `INFORMATION_SCHEMA.INNODB_LOCK_WAITS`, MySQL 8.x Performance Schema data locks, and the `SHOW REPLICA STATUS` terminology used by newer 8.x releases.
+
+## Schema Allowlist
+
+A data source can combine exact schema names with Glob patterns:
+
+```yaml
+default_database: orders_dev
+allowed_schemas:
+  - shared_reference
+allowed_schema_patterns:
+  - "*_dev"
+```
+
+`allowed_schemas` contains literal, complete schema names. Each `allowed_schema_patterns` entry must contain at least one `*` and is anchored to the complete schema name: only `*` is special and it matches any number of characters, including zero; every other character is literal. Put entries without a wildcard in `allowed_schemas`. Both forms are case-sensitive. A schema is allowed when it matches either list, so the example permits both `shared_reference` and names such as `orders_dev`. When both lists are empty, the application imposes no additional schema restriction.
+
+When either list is non-empty, an unqualified physical table is attributed to `default_database`, and that database must satisfy the same combined rules. Configure an allowed default database if clients use unqualified table names; without one, those references cannot be evaluated safely.
+
+The allowlist applies to direct physical table references visible in the request AST. It does not discover the underlying dependencies of views, and it does not change the existing instance-level boundary of monitoring tools. MySQL account `GRANT` permissions remain the final database authorization boundary: matching a configured name or pattern never grants access that the selected MySQL account does not already have.
 
 ## TLS Modes
 
@@ -400,10 +441,9 @@ See [config.example.yaml](config.example.yaml) for a complete, commented configu
 
 - `version` must currently be `1`.
 - YAML is parsed strictly: unknown fields, duplicate keys, merge keys, and multiple YAML documents are rejected.
-- Passwords may only be referenced through exactly one of `password_env` or `password_file`; the same rule applies to the HTTP Token.
+- Every database credential requires exactly one password source. Prefer `password: ${ENV_NAME}`; only that exact whole-value form reads the environment, and a missing or empty referenced variable fails validation. Other non-empty `password` scalars are supported as literal plaintext, without interpolation or default semantics, but should never be committed to Git. `password_env` and `password_file` remain compatible alternatives. HTTP Tokens continue to use exactly one of `token_env` or `token_file`.
 - Tokens must conform to the RFC 6750 `b64token` character set. Leading, trailing, or embedded whitespace, control characters, and values that cannot be placed in a Bearer Header are rejected before startup.
-- An empty `allowed_schemas` imposes no additional schema restriction. When it is non-empty, every direct physical table reference in the request AST must be demonstrably within the allowlist. Configuring `default_database` at the same time is recommended; otherwise, unqualified table names cannot be evaluated safely. A view's indirect dependencies do not appear in the request AST and must be controlled through least-privilege table grants and auditing of view definitions.
-- The schema allowlist uses exact case-sensitive matching. Whether MySQL database names are case-sensitive depends on the server platform; exact matching avoids accidentally authorizing a different database on a case-sensitive host.
+- `allowed_schemas` and `allowed_schema_patterns` follow the combined, anchored, case-sensitive rules described in [Schema Allowlist](#schema-allowlist). Whether MySQL database names are case-sensitive depends on the server platform; the application always preserves exact case to avoid authorizing a different database on a case-sensitive host.
 - `query_timeout` uses Go duration syntax, such as `500ms`, `10s`, or `2m`.
 - Sizes accept integer bytes or `KiB`, `MiB`, `GiB`, `KB`, `MB`, and `GB` suffixes.
 - Integers and DECIMAL values in results are represented as strings to avoid JSON/JavaScript precision loss; binary data is Base64-encoded.

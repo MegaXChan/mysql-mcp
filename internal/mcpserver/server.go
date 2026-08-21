@@ -81,12 +81,13 @@ func writeAnnotations() *mcp.ToolAnnotations {
 type infoInput struct{}
 
 type infoOutput struct {
-	Datasource      string             `json:"datasource"`
-	MySQLVersion    datasource.Version `json:"mysql_version"`
-	ReadOnly        bool               `json:"read_only"`
-	DefaultDatabase string             `json:"default_database,omitempty"`
-	AllowedSchemas  []string           `json:"allowed_schemas,omitempty"`
-	Features        map[string]bool    `json:"features"`
+	Datasource            string             `json:"datasource"`
+	MySQLVersion          datasource.Version `json:"mysql_version"`
+	ReadOnly              bool               `json:"read_only"`
+	DefaultDatabase       string             `json:"default_database,omitempty"`
+	AllowedSchemas        []string           `json:"allowed_schemas,omitempty"`
+	AllowedSchemaPatterns []string           `json:"allowed_schema_patterns,omitempty"`
+	Features              map[string]bool    `json:"features"`
 }
 
 func registerInfoTool(server *mcp.Server, source *datasource.Source) {
@@ -96,11 +97,12 @@ func registerInfoTool(server *mcp.Server, source *datasource.Source) {
 		Annotations: readOnlyAnnotations(),
 	}, guarded(source, func(_ context.Context, _ infoInput) (infoOutput, error) {
 		return infoOutput{
-			Datasource:      source.Name,
-			MySQLVersion:    source.Version,
-			ReadOnly:        source.ReadOnly,
-			DefaultDatabase: source.DefaultDatabase,
-			AllowedSchemas:  append([]string(nil), source.AllowedSchemas...),
+			Datasource:            source.Name,
+			MySQLVersion:          source.Version,
+			ReadOnly:              source.ReadOnly,
+			DefaultDatabase:       source.DefaultDatabase,
+			AllowedSchemas:        append([]string(nil), source.AllowedSchemas...),
+			AllowedSchemaPatterns: append([]string(nil), source.AllowedSchemaPatterns...),
 			Features: map[string]bool{
 				"dml":             source.Services.Command != nil && source.Features.DML,
 				"ddl":             source.Services.Command != nil && source.Features.DDL,

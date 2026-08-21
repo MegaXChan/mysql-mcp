@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/MegaXChan/mysql-mcp/internal/schemafilter"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -505,27 +506,30 @@ func validateSafeExpressionNode(node sqlparser.SQLNode, mysqlVersion int) error 
 	return nil
 }
 
-// ValidateAllowedSchemas verifies every physical table reference against an
-// allowlist. An unqualified table belongs to defaultDB for this decision. An
-// empty allowlist disables this additional restriction; a non-empty allowlist
-// with an empty defaultDB rejects unqualified physical tables because their
-// destination cannot be proven safe.
+// ValidateAllowedSchemas verifies every physical table reference against exact
+// names and optional glob patterns. An unqualified table belongs to defaultDB
+// for this decision. Empty exact and pattern lists disable this additional
+// restriction; any configured restriction with an empty defaultDB rejects
+// unqualified physical tables because their destination cannot be proven safe.
 //
 // CTE identifiers and derived-table aliases are not physical table references.
 // CTE scopes are tracked recursively so a name used by a nested CTE does not
 // accidentally exempt a physical table with the same name outside that scope.
-func ValidateAllowedSchemas(stmt sqlparser.Statement, defaultDB string, allowed []string) error {
-	if len(allowed) == 0 {
+func ValidateAllowedSchemas(
+	stmt sqlparser.Statement,
+	defaultDB string,
+	allowed []string,
+	patternGroups ...[]string,
+) error {
+	patterns := flattenSchemaPatterns(patternGroups)
+	if !schemafilter.Restricted(allowed, patterns) {
 		return nil
 	}
 	if stmt == nil {
 		return reject(CodeInvalidSQL, "statement AST is nil", nil)
 	}
 
-	allowedSchemas := make(map[string]struct{}, len(allowed))
-	for _, schema := range allowed {
-		allowedSchemas[schema] = struct{}{}
-	}
+	allowedSchemas := schemaRestrictions{exact: allowed, patterns: patterns}
 	if err := validateFullyParsedDDL(stmt); err != nil {
 		return err
 	}
@@ -539,28 +543,62 @@ func ValidateAllowedSchemas(stmt sqlparser.Statement, defaultDB string, allowed 
 // ValidateAllowedSchemas. It covers SELECT plus DML, DDL, database DDL, and
 // supported administrative ASTs; callers may use it for a generic execute
 // tool after applying that tool's separate authority/read-only policy.
-func ValidateCommandForSchemas(stmt sqlparser.Statement, defaultDB string, allowed []string) error {
-	return ValidateAllowedSchemas(stmt, defaultDB, allowed)
+func ValidateCommandForSchemas(
+	stmt sqlparser.Statement,
+	defaultDB string,
+	allowed []string,
+	patternGroups ...[]string,
+) error {
+	return ValidateAllowedSchemas(stmt, defaultDB, allowed, patternGroups...)
 }
 
 // ValidateReadQueryForSchemas combines the two checks in the required order:
 // establish that SQL is a safe SELECT first, then restrict its table schemas.
-func (p *Policy) ValidateReadQueryForSchemas(sql, defaultDB string, allowed []string) (sqlparser.Statement, error) {
+func (p *Policy) ValidateReadQueryForSchemas(
+	sql, defaultDB string,
+	allowed []string,
+	patternGroups ...[]string,
+) (sqlparser.Statement, error) {
 	stmt, err := p.ValidateReadQuery(sql)
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateAllowedSchemas(stmt, defaultDB, allowed); err != nil {
+	if err := ValidateAllowedSchemas(stmt, defaultDB, allowed, patternGroups...); err != nil {
 		return nil, err
 	}
 	return stmt, nil
+}
+
+// schemaRestrictions is immutable for one validation pass. Slices originate
+// from validated configuration and are read only while walking the SQL AST.
+type schemaRestrictions struct {
+	exact    []string
+	patterns []string
+}
+
+func flattenSchemaPatterns(groups [][]string) []string {
+	if len(groups) == 0 {
+		return nil
+	}
+	if len(groups) == 1 {
+		return groups[0]
+	}
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	patterns := make([]string, 0, total)
+	for _, group := range groups {
+		patterns = append(patterns, group...)
+	}
+	return patterns
 }
 
 func validateSchemaScope(
 	root sqlparser.SQLNode,
 	inheritedCTEs map[string]struct{},
 	defaultDB string,
-	allowedSchemas map[string]struct{},
+	allowedSchemas schemaRestrictions,
 ) error {
 	visibleCTEs := cloneNames(inheritedCTEs)
 	with := withClause(root)
@@ -648,7 +686,7 @@ func validateSchemaScope(
 func validateDirectCommandSchemas(
 	stmt sqlparser.Statement,
 	defaultDB string,
-	allowedSchemas map[string]struct{},
+	allowedSchemas schemaRestrictions,
 ) error {
 	if ddl, ok := stmt.(sqlparser.DDLStatement); ok {
 		for _, table := range ddl.AffectedTables() {
@@ -697,7 +735,7 @@ func validatePhysicalTable(
 	visibleCTEs map[string]struct{},
 	allowVirtualDual bool,
 	defaultDB string,
-	allowedSchemas map[string]struct{},
+	allowedSchemas schemaRestrictions,
 ) error {
 	if table.Qualifier.IsEmpty() {
 		// Vitess represents SELECT expressions without a FROM clause as reading
@@ -713,8 +751,8 @@ func validatePhysicalTable(
 	return validateSchemaName(table.Qualifier.String(), allowedSchemas)
 }
 
-func validateSchemaName(schema string, allowedSchemas map[string]struct{}) error {
-	if _, allowed := allowedSchemas[schema]; allowed {
+func validateSchemaName(schema string, allowedSchemas schemaRestrictions) error {
+	if schemafilter.Allows(schema, allowedSchemas.exact, allowedSchemas.patterns) {
 		return nil
 	}
 	detail := schema

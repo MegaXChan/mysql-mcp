@@ -114,6 +114,8 @@ curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/readyz
 ```
 
+`GET /healthz` 是存活探针，返回 `200 OK`。`GET /readyz` 在进程就绪时返回 `200 OK`，关闭过程中返回 `503 Service Unavailable`。两个端点都不要求 Token，并且会被故意排除在请求日志之外，避免持续探针产生噪声。
+
 ## 版本发布
 
 发布由 [Publish 工作流](.github/workflows/release.yml)驱动。所有进入发布流程的分支或标签都必须先通过标准校验及有界 SQL 策略 fuzz 测试，才会上传任何制品。
@@ -191,6 +193,19 @@ export ANALYTICS8_MONITOR_PASSWORD='...'
 ```
 
 `validate-config` 会执行严格配置校验并解析密钥引用，因此被引用的环境变量或密钥文件也必须存在。它不会在输出中打印密码或 Token。
+
+数据库密码首选在 `password` 字段中使用环境变量引用：
+
+```yaml
+credentials:
+  read:
+    username: mysql_mcp_orders_read
+    password: ${ORDERS57_READ_PASSWORD}
+```
+
+只有整个标量严格等于 `${ENV_NAME}`，且 `ENV_NAME` 是合法的环境变量名时，`mysql-mcp` 才会读取环境变量。这不是 shell、YAML 或通用模板展开；精确引用的变量缺失或为空时，启动和 `validate-config` 都会失败。其他任意非空 scalar 均作为明文密码原样使用，`prefix-${ENV_NAME}`、`${ENV_NAME:-default}` 等形式没有拼接或 default 语义，只是密码字面值。
+
+每个数据库凭据必须在 `password`、兼容写法 `password_env: ENV_NAME`、`password_file: path/to/secret` 中三选一。相对 secret 文件路径以配置文件目录为基准。容器或编排器把 secret 挂载为只读文件时仍可使用文件写法，但不能同时配置第二种密码来源。明文 `password` 虽受支持，但绝不应提交到 Git；配置诊断会对解析后的密码脱敏。
 
 示例配置定义了 `orders57` 和 `analytics8` 两个数据源，HTTP 端点分别为：
 
@@ -282,6 +297,14 @@ server:
 
 > `datasources[].tls` 只保护服务端到 MySQL 的连接，不会为 MCP HTTP 监听器启用 HTTPS。
 
+## HTTP 健康检查与请求日志
+
+`GET /healthz` 是存活端点，返回 `200 OK`。`GET /readyz` 是就绪端点：服务可接受请求时返回 `200 OK`，关闭过程中返回 `503 Service Unavailable`。两个路由均绕过 Token 认证。健康和就绪请求被有意设为不产生日志，避免编排器的高频探针淹没运维日志。
+
+其他每个已完成的 HTTP 请求都会产生一条结构化日志，且只包含 `method`、`path`、`status`、`response_bytes`、`duration_ms`、`remote_addr` 和 `request_id`。响应通过 `X-Request-ID` 返回对应标识，便于关联排查。
+
+请求日志不会记录 query string、`Authorization` 值或 Token、任何请求或响应 Header、body、SQL。`remote_addr` 是 Go 看到的直接对端地址；位于反向代理之后时，它表示代理而不是原始客户端。服务有意不信任 `X-Forwarded-For` 或其他转发地址 Header。
+
 ## 只读与写能力
 
 默认配置等价于：
@@ -372,7 +395,7 @@ MySQL 的 `SQL DATA ACCESS` 声明主要是元数据，不能替代应用 allowl
 每个 `datasources[]` 条目独立配置：
 
 - URL 名称、网络地址和默认数据库；
-- schema allowlist；
+- schema 精确名称与 Glob 模式 allowlist；
 - 读/写/监控凭据；
 - TLS 和连接池；
 - 监控能力；
@@ -381,6 +404,24 @@ MySQL 的 `SQL DATA ACCESS` 声明主要是元数据，不能替代应用 allowl
 数据源名称必须匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`，因此可安全地作为单个 URL path segment。名称在一个配置内不能重复。
 
 服务启动时读取实际 MySQL 版本，只接受 5.7.x 和 8.x，并为每个数据源创建对应版本的 Vitess parser。监控查询会处理主要版本差异，例如 5.7 的 `INFORMATION_SCHEMA.INNODB_LOCK_WAITS`、8.x 的 Performance Schema data locks，以及新版 8.x 的 `SHOW REPLICA STATUS` 术语。
+
+## Schema allowlist
+
+一个数据源可以组合 schema 精确名称和 Glob 模式：
+
+```yaml
+default_database: orders_dev
+allowed_schemas:
+  - shared_reference
+allowed_schema_patterns:
+  - "*_dev"
+```
+
+`allowed_schemas` 包含完整的字面 schema 名。每个 `allowed_schema_patterns` 模式必须至少包含一个 `*`，并锚定匹配完整 schema 名：只有 `*` 具有特殊含义，可匹配任意数量（包括零个）字符，其他字符均按字面值处理；不含通配符的名称应放入 `allowed_schemas`。两种匹配都严格区分大小写。schema 匹配任一列表即可允许，因此上例同时允许 `shared_reference` 和 `orders_dev` 等名称。两个列表都为空时，应用层不增加 schema 限制。
+
+任一列表非空时，未限定 schema 的物理表会归属于 `default_database`，该数据库必须符合相同的合并规则。客户端使用未限定 schema 的表名时，应配置一个符合 allowlist 的默认数据库；否则无法安全判断这些引用。
+
+allowlist 只检查请求 AST 中可见的直接物理表引用，不会发现视图的底层依赖，也不会改变监控工具既有的实例级边界。MySQL 账号的 `GRANT` 权限仍是最终的数据库授权边界：配置名称或模式匹配成功，绝不会赋予所选 MySQL 账号原本没有的权限。
 
 ## TLS 模式
 
@@ -400,10 +441,9 @@ MySQL 的 `SQL DATA ACCESS` 声明主要是元数据，不能替代应用 allowl
 
 - `version` 当前必须为 `1`。
 - YAML 使用严格解析：未知字段、重复 key、merge key 和多个 YAML document 都会被拒绝。
-- 密码只能通过 `password_env` 或 `password_file` 引用，二者必须二选一；HTTP Token 同理。
+- 每个数据库凭据必须且只能配置一种密码来源。首选 `password: ${ENV_NAME}`；只有该精确整值形式才读取环境变量，引用变量缺失或为空会导致校验失败。其他非空 `password` scalar 作为明文原样使用，不具有插值或 default 语义，且绝不应提交到 Git。`password_env` 和 `password_file` 仍作为兼容选项。HTTP Token 仍使用 `token_env` 与 `token_file` 二选一。
 - Token 必须符合 RFC 6750 `b64token` 字符集；首尾/内部空白、控制字符和无法放入 Bearer Header 的值会在启动前被拒绝。
-- `allowed_schemas` 为空表示不额外限制 schema；非空时，请求 AST 中的所有直接物理表引用都必须可证明属于 allowlist。使用非空 allowlist 时建议同时配置 `default_database`，否则无法安全判断未限定 schema 的表名。视图的间接依赖不出现在请求 AST 中，必须依靠表级最小权限和对视图定义的审计控制。
-- schema allowlist 使用精确大小写匹配；MySQL 数据库名是否区分大小写取决于服务器平台，精确匹配可避免在区分大小写的主机上误授权另一个数据库。
+- `allowed_schemas` 和 `allowed_schema_patterns` 遵循 [Schema allowlist](#schema-allowlist) 中的合并、整库名锚定和大小写精确匹配规则。MySQL 数据库名是否区分大小写取决于服务器平台；应用始终保留精确大小写，避免在区分大小写的主机上误授权另一个数据库。
 - `query_timeout` 使用 Go duration，例如 `500ms`、`10s`、`2m`。
 - 大小支持整数 byte 或 `KiB`、`MiB`、`GiB`、`KB`、`MB`、`GB`。
 - 结果中的整数和 DECIMAL 使用字符串表示，避免 JSON/JavaScript 精度损失；二进制数据使用 Base64。

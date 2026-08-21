@@ -16,7 +16,11 @@ func (c Config) Redacted() Config {
 	for index := range c.Datasources {
 		redacted.Datasources[index] = c.Datasources[index]
 		redacted.Datasources[index].AllowedSchemas = append([]string(nil), c.Datasources[index].AllowedSchemas...)
+		redacted.Datasources[index].AllowedSchemaPatterns = append([]string(nil), c.Datasources[index].AllowedSchemaPatterns...)
 		redacted.Datasources[index].Functions = append([]FunctionAllow(nil), c.Datasources[index].Functions...)
+		redacted.Datasources[index].Credentials.Read.PasswordValue = c.Datasources[index].Credentials.Read.safePasswordValue()
+		redacted.Datasources[index].Credentials.Write.PasswordValue = c.Datasources[index].Credentials.Write.safePasswordValue()
+		redacted.Datasources[index].Credentials.Monitor.PasswordValue = c.Datasources[index].Credentials.Monitor.safePasswordValue()
 		redacted.Datasources[index].Credentials.Read.password = ""
 		redacted.Datasources[index].Credentials.Write.password = ""
 		redacted.Datasources[index].Credentials.Monitor.password = ""

@@ -68,6 +68,36 @@ func TestMetadataServiceFiltersAllowedSchemasBeforeRowBound(t *testing.T) {
 	assertExpectations(t, mock)
 }
 
+func TestMetadataServiceFiltersAllowedSchemaPatternsBeforeRowBound(t *testing.T) {
+	// Scenario: the policy combines one exact schema with a *_dev glob while
+	// many unrelated schemas are visible. Risk covered: pattern filtering must
+	// happen in MySQL before the bounded collector, and the pattern must remain
+	// a bound value rather than becoming executable SQL syntax.
+	db, mock := newMockDatabase(t)
+	service, err := NewMetadataServiceWithMaxRows(db, time.Second, 3)
+	if err != nil {
+		t.Fatalf("NewMetadataServiceWithMaxRows() error = %v", err)
+	}
+	statement := listSchemasSelect +
+		"WHERE BINARY SCHEMA_NAME IN (?) OR BINARY SCHEMA_NAME LIKE BINARY ? ESCAPE '='\n" +
+		"ORDER BY SCHEMA_NAME"
+	mock.ExpectQuery(regexp.QuoteMeta(statement)).
+		WithArgs("shared", "%=_dev").
+		WillReturnRows(
+			sqlmock.NewRows([]string{"SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME"}).
+				AddRow("analytics_dev", "utf8mb4", "utf8mb4_bin").
+				AddRow("shared", "utf8mb4", "utf8mb4_bin"),
+		)
+
+	schemas, err := service.ListSchemasAllowed(
+		context.Background(), []string{"shared"}, []string{"*_dev"},
+	)
+	if err != nil || len(schemas) != 2 {
+		t.Fatalf("ListSchemasAllowed() = %#v, %v; want pattern and exact matches", schemas, err)
+	}
+	assertExpectations(t, mock)
+}
+
 func TestMetadataServiceDescribesTable(t *testing.T) {
 	// Scenario: a table contains required and nullable columns with a literal
 	// default. Risk covered: nullability and default metadata remain distinct;

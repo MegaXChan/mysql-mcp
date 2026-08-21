@@ -158,6 +158,11 @@ func TestRegistryDelegates(t *testing.T) {
 	if _, err := registry.ValidateReadQueryForSchemas("app", "SELECT * FROM app.orders", "app", []string{"app"}); err != nil {
 		t.Fatalf("ValidateReadQueryForSchemas() error = %v", err)
 	}
+	// Pattern-only restrictions use the same wrapper. This specifically proves
+	// the variadic compatibility parameter is forwarded rather than discarded.
+	if _, err := registry.ValidateReadQueryForSchemas("app", "SELECT * FROM orders_dev.orders", "", nil, []string{"*_dev"}); err != nil {
+		t.Fatalf("ValidateReadQueryForSchemas() pattern error = %v", err)
+	}
 	if _, err := registry.ValidateExplain("app", "EXPLAIN SELECT 1"); err != nil {
 		t.Fatalf("ValidateExplain() error = %v", err)
 	}

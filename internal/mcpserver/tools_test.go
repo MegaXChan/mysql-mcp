@@ -81,6 +81,61 @@ func TestReadOnlyMCPServerEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSchemaPatternMCPQueryAuthorization(t *testing.T) {
+	// This adapter-level regression proves allowed_schema_patterns is forwarded
+	// from the bound datasource into the SQL policy. A matching qualified schema
+	// and a matching default database may execute; a non-matching schema must be
+	// rejected before database/sql receives any operation.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	readDB, readMock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := openTestRegistry(t, readDB, nil, false)
+	source, _ := registry.Source("primary")
+	source.DefaultDatabase = "orders_dev"
+	source.AllowedSchemas = nil
+	source.AllowedSchemaPatterns = []string{"*_dev"}
+	clientSession, closeSessions := connectTestMCP(t, ctx, source)
+	defer closeSessions()
+
+	for _, statement := range []string{
+		"SELECT id FROM analytics_dev.events",
+		"SELECT id FROM events",
+	} {
+		readMock.ExpectBegin()
+		readMock.ExpectQuery(regexp.QuoteMeta(statement)).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+		readMock.ExpectRollback()
+		result, callErr := clientSession.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "mysql.query",
+			Arguments: map[string]any{"sql": statement},
+		})
+		if callErr != nil {
+			t.Fatalf("CallTool(mysql.query %q) protocol error = %v", statement, callErr)
+		}
+		if result.IsError {
+			t.Fatalf("CallTool(mysql.query %q) returned tool error: %+v", statement, result.Content)
+		}
+	}
+
+	rejected, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "mysql.query",
+		Arguments: map[string]any{"sql": "SELECT id FROM analytics_prod.events"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(non-matching schema) protocol error = %v", err)
+	}
+	if !rejected.IsError {
+		t.Fatal("non-matching schema passed allowed_schema_patterns")
+	}
+	if err := readMock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("read database expectations: %v", err)
+	}
+}
+
 func TestWritableMCPServerExecutesOnlyEnabledClass(t *testing.T) {
 	// A writable configuration gets a separate writer pool and exposes the one
 	// command tool. The test proves the DML route commits on that writer and that

@@ -6,6 +6,8 @@
 - `credentials.write`：DML、DDL、管理操作和 `effect: write` 存储函数；只读部署应省略。
 - `credentials.monitor`：固定监控查询；省略时会回退到读账号，但生产环境建议独立配置。
 
+配置这些账号时，数据库密码首选 `password: ${ENV_NAME}`。只有该精确整值形式才读取环境变量，变量缺失或为空会导致配置校验和启动失败；其他非空 scalar 会作为明文密码原样使用，不执行拼接或 default 展开。明文虽受支持但强烈不建议写入配置或提交 Git，诊断输出会对解析后的密码脱敏。`password_env` 与 `password_file` 仍兼容，但每个凭据必须在三者中只选一个。编排器提供文件 secret 时可继续使用 `password_file`，并以只读方式挂载、限制文件权限。
+
 下列 SQL 只是授权模板，需按实际 MySQL 版本、账号来源地址、schema、函数和监控项裁剪。不要直接复制到生产环境后授予所有可选权限。
 
 ## 只读账号
@@ -25,7 +27,9 @@ GRANT EXECUTE ON FUNCTION `orders`.`calculate_discount`
   TO 'mysql_mcp_orders_read'@'10.%';
 ```
 
-上面的 schema 级 `GRANT` 适合整个 schema 都属于同一信任域的部署。若 `allowed_schemas` 用于更严格的隔离，应改为逐表授权：视图的底层表/函数不会出现在客户端请求 AST 中，`SQL SECURITY DEFINER` 视图还可能借用定义者权限。只给逐个审计过的视图单独授权，并优先使用 `SQL SECURITY INVOKER`。
+上面的 schema 级 `GRANT` 适合整个 schema 都属于同一信任域的部署。若 `allowed_schemas` 或 `allowed_schema_patterns` 用于更严格的隔离，应改为逐表授权：视图的底层表/函数不会出现在客户端请求 AST 中，`SQL SECURITY DEFINER` 视图还可能借用定义者权限。只给逐个审计过的视图单独授权，并优先使用 `SQL SECURITY INVOKER`。
+
+例如，`allowed_schema_patterns: ["*_dev"]` 只影响应用层的 schema 判定，不会创建、扩展或替代任何 MySQL `GRANT`。模式以后匹配到的新 schema 也不会自动获得数据库权限；每个账号的实际 `GRANT` 始终是最终授权边界。反过来，账号拥有某项 `GRANT` 也不会绕过应用层 allowlist。应同时审查模式可能匹配的名称集合和账号被授予的具体对象。
 
 `INFORMATION_SCHEMA` 返回内容会随账号能看到的对象而变化。不要为了让元数据工具“看得更多”而授予业务不需要的 schema 权限。
 
@@ -77,7 +81,7 @@ GRANT SELECT ON `performance_schema`.*
 
 监控账号不需要 UPDATE Performance Schema setup tables，因为服务不会修改 consumers/instruments；如果目标实例没有启用所需 consumer，应由 DBA 在服务之外管理。
 
-监控是实例级能力，不受业务 `allowed_schemas` 的完整隔离：会话、锁、digest、InnoDB 状态和复制信息可能包含其他 schema 的对象名或 SQL 文本。需要租户隔离时应关闭这些监控项，或把监控端点放在独立服务/Token 后。
+监控是实例级能力，不受业务 `allowed_schemas` 与 `allowed_schema_patterns` 的完整隔离：会话、锁、digest、InnoDB 状态和复制信息可能包含其他 schema 的对象名或 SQL 文本。需要租户隔离时应关闭这些监控项，或把监控端点放在独立服务/Token 后。
 
 MySQL 5.7 和 8.0 的锁表、复制术语与动态权限不同。应先只授予当前启用监控项所需的权限，运行 `validate-config` 和预生产探测，再依据明确的 access denied 错误补充，而不是预先授予 `SUPER`。
 

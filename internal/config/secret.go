@@ -75,8 +75,20 @@ func isBearerTokenCharacter(character byte) bool {
 }
 
 func resolveCredential(credential *Credential, configDirectory, datasourceName, role string) error {
+	environmentName := credential.PasswordEnv
+	if credential.PasswordValue != "" {
+		if referencedEnvironment, valid := passwordReferenceEnvironment(credential.PasswordValue); valid {
+			environmentName = referencedEnvironment
+		} else {
+			// A password is interpreted as an environment reference only when the
+			// entire value matches ${ENV_NAME}; every other non-empty scalar is
+			// literal and must never be included in an error message.
+			credential.password = credential.PasswordValue
+			return nil
+		}
+	}
 	secret, err := resolveSecret(
-		credential.PasswordEnv,
+		environmentName,
 		credential.PasswordFile,
 		configDirectory,
 		fmt.Sprintf("datasource %q %s password", datasourceName, role),

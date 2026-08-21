@@ -554,6 +554,87 @@ func TestValidateReadQueryForSchemas(t *testing.T) {
 	requireViolationCode(t, err, CodeNotReadQuery)
 }
 
+// TestValidateAllowedSchemaPatterns covers the shared glob authorization path
+// for reads. These cases are security-sensitive because configuring a pattern
+// must activate the restriction even when allowed_schemas is empty, and an
+// unqualified table must be checked against its resolved default database.
+func TestValidateAllowedSchemaPatterns(t *testing.T) {
+	t.Parallel()
+	configured := newTestPolicy(t, "8.0.36")
+
+	for _, test := range []struct {
+		name      string
+		sql       string
+		defaultDB string
+		exact     []string
+		patterns  []string
+		wantCode  ViolationCode
+	}{
+		{name: "empty configuration remains unrestricted", sql: "SELECT * FROM orders_prod.orders"},
+		{name: "suffix pattern allows qualified schema", sql: "SELECT * FROM orders_dev.orders", patterns: []string{"*_dev"}},
+		{name: "suffix pattern allows default schema", sql: "SELECT * FROM orders", defaultDB: "orders_dev", patterns: []string{"*_dev"}},
+		{name: "exact name and pattern form a union", sql: "SELECT * FROM shared.orders JOIN audit_dev.events USING(id)", exact: []string{"shared"}, patterns: []string{"*_dev"}},
+		{name: "pattern activates restriction", sql: "SELECT * FROM orders_prod.orders", patterns: []string{"*_dev"}, wantCode: CodeSchemaNotAllowed},
+		{name: "disallowed default schema", sql: "SELECT * FROM orders", defaultDB: "orders_prod", patterns: []string{"*_dev"}, wantCode: CodeSchemaNotAllowed},
+		{name: "missing default fails closed", sql: "SELECT * FROM orders", patterns: []string{"*_dev"}, wantCode: CodeSchemaNotAllowed},
+		{name: "matching is case sensitive", sql: "SELECT * FROM ORDERS_DEV.orders", patterns: []string{"*_dev"}, wantCode: CodeSchemaNotAllowed},
+		{name: "pattern is anchored to full schema", sql: "SELECT * FROM orders_dev_archive.orders", patterns: []string{"*_dev"}, wantCode: CodeSchemaNotAllowed},
+		{name: "literal select does not require default schema", sql: "SELECT 1", defaultDB: "orders_prod", patterns: []string{"*_dev"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := configured.ValidateReadQueryForSchemas(test.sql, test.defaultDB, test.exact, test.patterns)
+			if test.wantCode == "" {
+				if err != nil {
+					t.Fatalf("ValidateReadQueryForSchemas() error = %v", err)
+				}
+				return
+			}
+			requireViolationCode(t, err, test.wantCode)
+		})
+	}
+}
+
+// TestValidateCommandForSchemaPatterns ensures every command-specific schema
+// reference uses the same glob boundary. It exercises DML targets and sources,
+// DDL destinations, database DDL, and USE so a secondary schema cannot bypass
+// authorization merely because the primary target matched the pattern.
+func TestValidateCommandForSchemaPatterns(t *testing.T) {
+	t.Parallel()
+	configured := newTestPolicy(t, "8.0.36")
+
+	for _, test := range []struct {
+		name     string
+		sql      string
+		wantCode ViolationCode
+	}{
+		{name: "DML target and source match", sql: "INSERT INTO orders_dev.archive(id) SELECT id FROM audit_dev.events"},
+		{name: "DDL target and source match", sql: "CREATE TABLE orders_dev.copy LIKE audit_dev.orders"},
+		{name: "database DDL matches", sql: "CREATE DATABASE tenant_dev"},
+		{name: "USE matches", sql: "USE tenant_dev"},
+		{name: "DML source outside pattern", sql: "INSERT INTO orders_dev.archive(id) SELECT id FROM audit_prod.events", wantCode: CodeSchemaNotAllowed},
+		{name: "rename destination outside pattern", sql: "RENAME TABLE orders_dev.current TO orders_prod.current", wantCode: CodeSchemaNotAllowed},
+		{name: "database DDL outside pattern", sql: "DROP DATABASE tenant_prod", wantCode: CodeSchemaNotAllowed},
+		{name: "USE outside pattern", sql: "USE tenant_prod", wantCode: CodeSchemaNotAllowed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			stmt, err := configured.ParseOne(test.sql)
+			if err != nil {
+				t.Fatalf("ParseOne() error = %v", err)
+			}
+			err = ValidateCommandForSchemas(stmt, "", nil, []string{"*_dev"})
+			if test.wantCode == "" {
+				if err != nil {
+					t.Fatalf("ValidateCommandForSchemas() error = %v", err)
+				}
+				return
+			}
+			requireViolationCode(t, err, test.wantCode)
+		})
+	}
+}
+
 // TestValidateCommandForSchemas proves execute-style operations cannot escape
 // allowed_schemas through either a target or a secondary source. It includes
 // MySQL's multi-source DML and DDL forms, where checking only the first table
@@ -914,6 +995,8 @@ func TestValidateAllowedSchemasNilAST(t *testing.T) {
 		t.Fatalf("empty allowlist with nil AST error = %v", err)
 	}
 	err := ValidateAllowedSchemas(nil, "app", []string{"app"})
+	requireViolationCode(t, err, CodeInvalidSQL)
+	err = ValidateAllowedSchemas(nil, "", nil, []string{"*_dev"})
 	requireViolationCode(t, err, CodeInvalidSQL)
 }
 

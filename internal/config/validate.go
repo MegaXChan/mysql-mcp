@@ -8,15 +8,18 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/MegaXChan/mysql-mcp/internal/schemafilter"
 )
 
 var (
-	datasourceNamePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
-	environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	datasourceNamePattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+	environmentNamePattern   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	passwordReferencePattern = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$`)
 )
 
 // Validate checks all structural, safety, and cross-field invariants. Secret
-// references are checked here; their values are resolved only by Load.
+// source metadata is checked here; effective values are populated only by Load.
 func (c *Config) Validate() error {
 	if c == nil {
 		return errors.New("config validation failed: config is nil")
@@ -138,7 +141,6 @@ func validateDatasource(datasource *DatasourceConfig, features FeatureConfig, gl
 		}
 	}
 	seenSchemas := make(map[string]struct{}, len(datasource.AllowedSchemas))
-	allowedSchemaNames := make(map[string]struct{}, len(datasource.AllowedSchemas))
 	for index, schema := range datasource.AllowedSchemas {
 		if err := validateMySQLIdentifier(schema); err != nil {
 			return fmt.Errorf("allowed_schemas[%d]: %w", index, err)
@@ -151,7 +153,36 @@ func validateDatasource(datasource *DatasourceConfig, features FeatureConfig, gl
 			return fmt.Errorf("allowed_schemas[%d]: duplicate schema %q", index, schema)
 		}
 		seenSchemas[key] = struct{}{}
-		allowedSchemaNames[schema] = struct{}{}
+	}
+	seenSchemaPatterns := make(map[string]struct{}, len(datasource.AllowedSchemaPatterns))
+	for index, pattern := range datasource.AllowedSchemaPatterns {
+		// Keep exact names in allowed_schemas. Requiring a wildcard here makes
+		// configuration reviews unambiguous and catches accidental use of the
+		// wrong field without broadening access.
+		if !strings.ContainsRune(pattern, '*') {
+			return fmt.Errorf("allowed_schema_patterns[%d]: must contain at least one * wildcard; use allowed_schemas for exact names", index)
+		}
+		if err := schemafilter.Validate(pattern); err != nil {
+			return fmt.Errorf("allowed_schema_patterns[%d]: %w", index, err)
+		}
+		// Schema matching is deliberately case-sensitive, so duplicate pattern
+		// detection uses exact equality as well.
+		if _, exists := seenSchemaPatterns[pattern]; exists {
+			return fmt.Errorf("allowed_schema_patterns[%d]: duplicate pattern %q", index, pattern)
+		}
+		seenSchemaPatterns[pattern] = struct{}{}
+	}
+	if datasource.DefaultDatabase != "" &&
+		schemafilter.Restricted(datasource.AllowedSchemas, datasource.AllowedSchemaPatterns) &&
+		!schemafilter.Allows(
+			datasource.DefaultDatabase,
+			datasource.AllowedSchemas,
+			datasource.AllowedSchemaPatterns,
+		) {
+		return fmt.Errorf(
+			"default_database %q is outside allowed_schemas and allowed_schema_patterns",
+			datasource.DefaultDatabase,
+		)
 	}
 
 	if err := validateCredential("read", datasource.Credentials.Read, true); err != nil {
@@ -180,11 +211,11 @@ func validateDatasource(datasource *DatasourceConfig, features FeatureConfig, gl
 	if err := validateFunctions(datasource.Functions, features.FunctionWrite, effectiveReadOnly); err != nil {
 		return fmt.Errorf("functions: %w", err)
 	}
-	if len(allowedSchemaNames) > 0 {
+	if schemafilter.Restricted(datasource.AllowedSchemas, datasource.AllowedSchemaPatterns) {
 		for index, function := range datasource.Functions {
 			schema, _, _ := strings.Cut(function.Name, ".")
-			if _, allowed := allowedSchemaNames[schema]; !allowed {
-				return fmt.Errorf("functions[%d].name schema %q is outside allowed_schemas", index, schema)
+			if !schemafilter.Allows(schema, datasource.AllowedSchemas, datasource.AllowedSchemaPatterns) {
+				return fmt.Errorf("functions[%d].name schema %q is outside allowed_schemas and allowed_schema_patterns", index, schema)
 			}
 		}
 	}
@@ -198,13 +229,25 @@ func validateCredential(role string, credential Credential, required bool) error
 	if credential.Username == "" {
 		return fmt.Errorf("credentials.%s.username is required", role)
 	}
-	if countNonEmpty(credential.PasswordEnv, credential.PasswordFile) != 1 {
-		return fmt.Errorf("credentials.%s requires exactly one of password_env or password_file", role)
+	if countNonEmpty(credential.PasswordValue, credential.PasswordEnv, credential.PasswordFile) != 1 {
+		return fmt.Errorf("credentials.%s requires exactly one of password, password_env, or password_file", role)
 	}
 	if credential.PasswordEnv != "" && !environmentNamePattern.MatchString(credential.PasswordEnv) {
 		return fmt.Errorf("credentials.%s.password_env is not a valid environment variable name", role)
 	}
 	return nil
+}
+
+// passwordReferenceEnvironment extracts an environment-variable name only
+// when the complete password value uses ${ENV_NAME}. Other non-empty values are
+// literal passwords; no shell expansion, concatenation, or default syntax is
+// interpreted.
+func passwordReferenceEnvironment(reference string) (string, bool) {
+	match := passwordReferencePattern.FindStringSubmatch(reference)
+	if len(match) != 2 {
+		return "", false
+	}
+	return match[1], true
 }
 
 func validateTLS(tls TLS) error {

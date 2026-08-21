@@ -106,17 +106,19 @@ func (r *Registry) ValidateReadQuery(datasource, sql string) (sqlparser.Statemen
 func (r *Registry) ValidateReadQueryForSchemas(
 	datasource, sql, defaultDB string,
 	allowed []string,
+	patternGroups ...[]string,
 ) (sqlparser.Statement, error) {
 	configured, err := r.PolicyFor(datasource)
 	if err != nil {
 		return nil, err
 	}
-	return configured.ValidateReadQueryForSchemas(sql, defaultDB, allowed)
+	return configured.ValidateReadQueryForSchemas(sql, defaultDB, allowed, patternGroups...)
 }
 
 // ValidateCommand applies raw DML/DDL expression safety with the named
 // datasource's version-aware parser. Schema validation remains a separate call
-// because default_database and allowed_schemas belong to datasource config.
+// because default_database and both schema allow-list forms belong to
+// datasource configuration.
 func (r *Registry) ValidateCommand(datasource, sql string) (Classification, error) {
 	configured, err := r.PolicyFor(datasource)
 	if err != nil {

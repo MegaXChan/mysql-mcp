@@ -37,7 +37,9 @@ func registerQueryTools(server *mcp.Server, source *datasource.Source) {
 		if err := validateSQLInput(source, input.SQL, input.Args); err != nil {
 			return database.QueryResult{}, err
 		}
-		if _, err := source.Policy.ValidateReadQueryForSchemas(input.SQL, source.DefaultDatabase, source.AllowedSchemas); err != nil {
+		if _, err := source.Policy.ValidateReadQueryForSchemas(
+			input.SQL, source.DefaultDatabase, source.AllowedSchemas, source.AllowedSchemaPatterns,
+		); err != nil {
 			return database.QueryResult{}, err
 		}
 		limit, err := responseRowLimit(source, input.MaxRows)
@@ -59,7 +61,9 @@ func registerQueryTools(server *mcp.Server, source *datasource.Source) {
 		if err := validateSQLInput(source, input.SQL, input.Args); err != nil {
 			return database.QueryResult{}, err
 		}
-		if _, err := source.Policy.ValidateReadQueryForSchemas(input.SQL, source.DefaultDatabase, source.AllowedSchemas); err != nil {
+		if _, err := source.Policy.ValidateReadQueryForSchemas(
+			input.SQL, source.DefaultDatabase, source.AllowedSchemas, source.AllowedSchemaPatterns,
+		); err != nil {
 			return database.QueryResult{}, err
 		}
 		return source.Services.Query.Query(ctx, "EXPLAIN "+input.SQL, input.Args...)
@@ -92,7 +96,9 @@ func registerQueryTools(server *mcp.Server, source *datasource.Source) {
 		default:
 			return database.CommandResult{}, fmt.Errorf("statement class %q is not accepted by mysql.execute", classification.Class)
 		}
-		if err := policy.ValidateCommandForSchemas(classification.Statement, source.DefaultDatabase, source.AllowedSchemas); err != nil {
+		if err := policy.ValidateCommandForSchemas(
+			classification.Statement, source.DefaultDatabase, source.AllowedSchemas, source.AllowedSchemaPatterns,
+		); err != nil {
 			return database.CommandResult{}, err
 		}
 		if classification.Class == policy.ClassDDL {

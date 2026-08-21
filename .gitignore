@@ -1,0 +1,23 @@
+# Local Go build/module caches used by the project test commands.
+/.buildcache/
+/.gomodcache/
+/.gopath/
+
+# Build and coverage outputs.
+/bin/
+/dist/
+/coverage.out
+/coverage.html
+
+# Local configuration and secrets. Keep config.example.yaml tracked.
+/config.yaml
+/secrets/
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+*.password
+
+# IDE metadata is not part of the service source.
+/.idea/
